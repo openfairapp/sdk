@@ -1,0 +1,35 @@
+{
+  "name": "@openfair/sdk",
+  "version": "1.1.1",
+  "description": "openfair launchpad SDK – quotes, simulation, staged token launches, token registry and referral revenue on Robinhood Chain.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": ["./dist/widget.mjs", "./dist/widget.cjs"],
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./types/sdk/npm.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/sdk/npm.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    },
+    "./widget": {
+      "types": "./types/sdk/widget.d.ts",
+      "import": "./dist/widget.mjs",
+      "require": "./dist/widget.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "types", "README.md"],
+  "scripts": {
+    "build": "esbuild sdk/npm.ts --bundle --format=esm --external:viem --target=es2020 --outfile=dist/index.mjs && esbuild sdk/npm.ts --bundle --format=cjs --external:viem --target=es2020 --outfile=dist/index.cjs && esbuild sdk/widget.ts --bundle --format=esm --external:viem --target=es2020 --outfile=dist/widget.mjs && esbuild sdk/widget.ts --bundle --format=cjs --external:viem --target=es2020 --outfile=dist/widget.cjs && tsc -p tsconfig.json",
+    "build:browser": "esbuild sdk/index.ts --bundle --format=iife --minify --target=es2020 --outfile=dist/openfair.js"
+  },
+  "repository": { "type": "git", "url": "git+https://github.com/openfair-app/sdk.git" },
+  "homepage": "https://openfair.app",
+  "bugs": { "url": "https://github.com/openfair-app/sdk/issues" },
+  "peerDependencies": { "viem": "^2.0.0" },
+  "devDependencies": { "esbuild": "^0.24.0", "typescript": "^5.6.0", "viem": "^2.0.0" },
+  "keywords": ["openfair", "launchpad", "token", "robinhood-chain", "web3", "fair-launch", "mcp"]
+}

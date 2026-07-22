@@ -1,0 +1,308 @@
+openapi: 3.1.0
+info:
+  title: openfair API
+  version: "1.0"
+  description: |
+    Versioned public API of the openfair launchpad (Robinhood Chain, chainId 4663).
+    Conventions: every response is wrapped in `{data, meta}` / `{error, meta}`;
+    addresses are checksummed; wei values are strings; lists use cursor pagination;
+    POST endpoints that compute (quote/simulate) are rate-limited (RateLimit-* headers).
+    Policy: launches prepared via this API carry platformShareBps ≥ 1500 (15%);
+    5000+ grants Supporter status (creation is free).
+  contact: { url: "https://openfair.app" }
+servers:
+  - url: https://openfair.app/api/v1
+tags:
+  - { name: public, description: config, fees, tokens, launches }
+  - { name: compute, description: quote & simulation (rate-limited) }
+  - { name: referrals }
+  - { name: sessions, description: launch sessions (partner API key for creation) }
+  - { name: events, description: SSE stream & webhooks }
+components:
+  securitySchemes:
+    partnerKey: { type: http, scheme: bearer, description: "partner API key (of_…); scopes: launches:prepare, webhooks:manage" }
+  schemas:
+    Meta:
+      type: object
+      properties:
+        requestId: { type: string }
+        apiVersion: { type: string }
+        chainId: { type: integer }
+        factoryVersion: { type: string }
+        generatedAt: { type: string, format: date-time }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+            stage: { type: string }
+            retriable: { type: boolean }
+            contractReason: { type: string }
+            suggestedAction: { type: string }
+        meta: { $ref: "#/components/schemas/Meta" }
+    Token:
+      type: object
+      properties:
+        address: { type: string }
+        name: { type: string }
+        symbol: { type: string }
+        mode: { type: string, enum: [fair, instant] }
+        status: { type: string, enum: [curve, graduated, dex] }
+        contractVersion: { type: string }
+        creator: { type: string }
+        referrer: { type: [string, "null"] }
+        totalSupplyWei: { type: string }
+        createdAt: { type: string, format: date-time }
+        createdAtUnix: { type: integer }
+        graduated: { type: boolean }
+        pool: { type: [string, "null"] }
+        marketCapUsd: { type: [number, "null"] }
+        logoUrl: { type: [string, "null"] }
+        urls:
+          type: object
+          properties:
+            openfair: { type: string }
+            explorer: { type: string }
+            dex: { type: [string, "null"] }
+    TokenList:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Token" } }
+        nextCursor: { type: [string, "null"] }
+        total: { type: integer }
+    Quote:
+      type: object
+      properties:
+        quoteId: { type: string }
+        configHash: { type: string }
+        mode: { type: string, enum: [fair, instant] }
+        factory: { type: string }
+        deployFeeWei: { type: string }
+        supporterDiscountWei: { type: string }
+        gasEstimateWei: { type: string, description: "includes a +20% safety multiplier" }
+        requiredValueWei: { type: string }
+        estimatedTotalWei: { type: string }
+        platformShareBps: { type: integer, minimum: 1500 }
+        referralShareBps: { type: integer }
+        expiresAt: { type: string, format: date-time }
+        warnings: { type: array, items: { type: string } }
+    Simulation:
+      type: object
+      properties:
+        success: { type: boolean }
+        blockNumber: { type: string }
+        estimatedGas: { type: [string, "null"] }
+        requiredBalanceWei: { type: string }
+        creatorBalanceWei: { type: string }
+        configHash: { type: string }
+        contractReason: { type: [string, "null"] }
+        checks:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              status: { type: string, enum: [passed, failed] }
+              detail: { type: string }
+    Session:
+      type: object
+      properties:
+        sessionId: { type: string }
+        status: { type: string, enum: [awaiting_wallet, completed, cancelled, expired] }
+        mode: { type: string }
+        configHash: { type: string }
+        handoffUrl: { type: string }
+        requiresWalletApproval: { type: boolean, const: true }
+        expiresAt: { type: string, format: date-time }
+        txHash: { type: [string, "null"] }
+        token: { type: [string, "null"] }
+paths:
+  /config:
+    get:
+      tags: [public]
+      summary: Network & contract configuration (ETag, cached 5 min)
+      responses:
+        "200": { description: OK }
+        "304": { description: Not modified }
+  /fees:
+    get:
+      tags: [public]
+      summary: Live creation fees (validUntil in payload)
+      responses: { "200": { description: OK } }
+  /tokens:
+    get:
+      tags: [public]
+      summary: Token list (cursor pagination)
+      parameters:
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 100 } }
+        - { name: mode, in: query, schema: { type: string, enum: [fair, instant] } }
+        - { name: status, in: query, schema: { type: string, enum: [curve, graduated, dex] } }
+        - { name: creator, in: query, schema: { type: string } }
+        - { name: referrer, in: query, schema: { type: string } }
+        - { name: symbol, in: query, schema: { type: string } }
+        - { name: sort, in: query, schema: { type: string, enum: [new, volume] } }
+      responses: { "200": { description: OK } }
+  /tokens/{address}:
+    get:
+      tags: [public]
+      summary: Full token card (badges, trust score, curve state)
+      parameters: [{ name: address, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: OK }, "404": { description: not indexed } }
+  /launches:
+    get: { tags: [public], summary: Alias of /tokens, responses: { "200": { description: OK } } }
+  /launches/{address}/status:
+    get:
+      tags: [public]
+      summary: Light polling endpoint (confirmations, finality, graduation progress)
+      parameters: [{ name: address, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: "OK (also for unknown tokens: status=unknown_or_indexing)" } }
+  /launches/quote:
+    post:
+      tags: [compute]
+      summary: Validate a launch config and produce a full cost quote (5-min TTL)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode, token]
+              properties:
+                mode: { type: string, enum: [fair, instant] }
+                creator: { type: string }
+                referrer: { type: string }
+                platformShareBps: { type: integer, minimum: 1500, default: 5000 }
+                token:
+                  type: object
+                  required: [name, symbol]
+                  properties:
+                    name: { type: string, maxLength: 64 }
+                    symbol: { type: string, maxLength: 10 }
+                    totalSupply: { type: number }
+                fair:
+                  type: object
+                  properties:
+                    curveType: { type: string, enum: [classic, linear, exponential] }
+                    buyFeeBps: { type: integer, maximum: 1000 }
+                    sellFeeBps: { type: integer, maximum: 1000 }
+                    antiSnipe: { type: string, enum: [standard, normal, hardcore] }
+                    startTime: { type: integer }
+                    sellsEnabled: { type: boolean }
+                instant:
+                  type: object
+                  properties:
+                    poolPct: { type: number, minimum: 1, maximum: 100 }
+                    seedEth: { type: number }
+      responses:
+        "200": { description: quote, content: { application/json: { schema: { $ref: "#/components/schemas/Quote" } } } }
+        "400": { description: validation error, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { description: rate limited }
+  /launches/simulate:
+    post:
+      tags: [compute]
+      summary: Dry-run a quoted launch (balance, self-referral, contract eth_call); signs nothing
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quoteId, creator]
+              properties:
+                quoteId: { type: string }
+                creator: { type: string }
+      responses:
+        "200": { description: simulation, content: { application/json: { schema: { $ref: "#/components/schemas/Simulation" } } } }
+        "404": { description: unknown/expired quote }
+  /referrers/{address}/summary:
+    get: { tags: [referrals], summary: Referral totals + claimable, parameters: [{ name: address, in: path, required: true, schema: { type: string } }], responses: { "200": { description: OK } } }
+  /referrers/{address}/tokens:
+    get: { tags: [referrals], summary: Tokens launched through the referrer, parameters: [{ name: address, in: path, required: true, schema: { type: string } }], responses: { "200": { description: OK } } }
+  /referrers/{address}/rewards:
+    get: { tags: [referrals], summary: Per-launch claimable (live on-chain reads), parameters: [{ name: address, in: path, required: true, schema: { type: string } }], responses: { "200": { description: OK } } }
+  /referrers/{address}/payments:
+    get: { tags: [referrals], summary: Payment history, parameters: [{ name: address, in: path, required: true, schema: { type: string } }], responses: { "501": { description: requires event indexing (not live yet) } } }
+  /referrals/claims/prepare:
+    post:
+      tags: [referrals]
+      summary: Unsigned claimFees transactions for the referrer's wallet (server never signs)
+      requestBody: { content: { application/json: { schema: { type: object, required: [referrer], properties: { referrer: { type: string } } } } } }
+      responses: { "200": { description: unsigned tx list } }
+  /launch-sessions:
+    post:
+      tags: [sessions]
+      summary: Freeze a quote into a one-time session with a wallet-handoff URL (20-min TTL)
+      security: [{ partnerKey: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quoteId]
+              properties:
+                quoteId: { type: string }
+                metadataCid: { type: string }
+                returnUrl: { type: string, description: https only }
+      responses:
+        "200": { description: session, content: { application/json: { schema: { $ref: "#/components/schemas/Session" } } } }
+        "401": { description: partner API key required }
+  /launch-sessions/{id}:
+    get:
+      tags: [sessions]
+      summary: Read a session (id is the capability; `?full=1` adds exact on-chain params for the handoff page)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: OK }, "404": { description: unknown } }
+    delete:
+      tags: [sessions]
+      summary: Cancel an awaiting session
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: OK } }
+  /launch-sessions/{id}/refresh-quote:
+    post:
+      tags: [sessions]
+      summary: Extend the session TTL and report the current fee
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: OK }, "409": { description: session closed } }
+  /launch-sessions/{id}/complete:
+    post:
+      tags: [sessions]
+      summary: Mark the session completed (called by the openfair UI after the user's wallet broadcast)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { content: { application/json: { schema: { type: object, required: [txHash], properties: { txHash: { type: string }, token: { type: string } } } } } }
+      responses: { "200": { description: OK }, "409": { description: one-time — already closed } }
+  /events:
+    get:
+      tags: [events]
+      summary: "SSE stream (topics: launch.indexed, fair.graduated, trade.executed, session.completed; filters: topics, referrer)"
+      parameters:
+        - { name: topics, in: query, schema: { type: string, description: comma-separated } }
+        - { name: referrer, in: query, schema: { type: string } }
+      responses: { "200": { description: "text/event-stream" } }
+  /webhooks:
+    post:
+      tags: [events]
+      summary: Register a webhook (HMAC-signed deliveries, 3 retries with backoff; secret shown once)
+      security: [{ partnerKey: [] }]
+      requestBody: { content: { application/json: { schema: { type: object, required: [url, topics], properties: { url: { type: string, description: https only }, topics: { type: array, items: { type: string } } } } } } }
+      responses: { "200": { description: created (includes secret once) } }
+    get:
+      tags: [events]
+      summary: List webhooks
+      security: [{ partnerKey: [] }]
+      responses: { "200": { description: OK } }
+  /webhooks/{id}:
+    delete:
+      tags: [events]
+      summary: Delete a webhook
+      security: [{ partnerKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: OK } }
+  /webhooks/{id}/rotate-secret:
+    post:
+      tags: [events]
+      summary: Rotate the signing secret (re-enables a disabled hook)
+      security: [{ partnerKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: new secret (shown once) } }
