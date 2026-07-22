@@ -14,7 +14,7 @@ npm install @openfair/sdk viem
 Or drop-in for any web page (no build step):
 
 ```html
-<script src="https://sdk.openfair.app/v1.1.1/openfair.js"
+<script src="https://sdk.openfair.app/v1.1.2/openfair.js"
         integrity="sha384-…" crossorigin="anonymous"></script>
 <openfair-create ref="0xYourWallet"></openfair-create>
 ```

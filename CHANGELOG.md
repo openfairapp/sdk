@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.2 · 2026-07-22
+
+- Package README on npmjs.com and `repository` metadata pointing to [github.com/openfairapp/sdk](https://github.com/openfairapp/sdk). No code changes.
+
 ## 1.1.1 · 2026-07-21
 
 - Fixed: `@openfair/sdk/widget` no longer crashes when imported in Node/SSR (Next.js) — the element extends `HTMLElement` only in a real DOM.

@@ -13,7 +13,7 @@ import {
 import { CHAIN, ADDR, POOL_FEE_TIER, START_FDV_ETH, TARGET_ETH, SUPPORTER_SHARE_BPS } from '../src/lib/config';
 import { factoryAbi } from '../src/lib/abi';
 
-export const SDK_VERSION = '1.1.1';
+export const SDK_VERSION = '1.1.2';
 
 const ZERO = '0x0000000000000000000000000000000000000000' as const;
 const ZERO_SALT = ('0x' + '0'.repeat(64)) as `0x${string}`;
