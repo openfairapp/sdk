@@ -26,9 +26,9 @@
     "build": "esbuild sdk/npm.ts --bundle --format=esm --external:viem --target=es2020 --outfile=dist/index.mjs && esbuild sdk/npm.ts --bundle --format=cjs --external:viem --target=es2020 --outfile=dist/index.cjs && esbuild sdk/widget.ts --bundle --format=esm --external:viem --target=es2020 --outfile=dist/widget.mjs && esbuild sdk/widget.ts --bundle --format=cjs --external:viem --target=es2020 --outfile=dist/widget.cjs && tsc -p tsconfig.json",
     "build:browser": "esbuild sdk/index.ts --bundle --format=iife --minify --target=es2020 --outfile=dist/openfair.js"
   },
-  "repository": { "type": "git", "url": "git+https://github.com/openfair-app/sdk.git" },
+  "repository": { "type": "git", "url": "git+https://github.com/openfairapp/sdk.git" },
   "homepage": "https://openfair.app",
-  "bugs": { "url": "https://github.com/openfair-app/sdk/issues" },
+  "bugs": { "url": "https://github.com/openfairapp/sdk/issues" },
   "peerDependencies": { "viem": "^2.0.0" },
   "devDependencies": { "esbuild": "^0.24.0", "typescript": "^5.6.0", "viem": "^2.0.0" },
   "keywords": ["openfair", "launchpad", "token", "robinhood-chain", "web3", "fair-launch", "mcp"]
