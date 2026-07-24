@@ -1,6 +1,11 @@
 # @openfair/sdk
 
-Official SDK for [openfair](https://openfair.app) — the non-custodial fair token launchpad on **Robinhood Chain** (chainId 4663). Launch tokens from your own site, app, script or AI agent; every launch made through your integration records your wallet as the **on-chain referrer**, entitling you to half of the platform's fee share for that token — forever, enforced by the contracts, not by a server.
+Official SDK for [openfair](https://openfair.app) – the non-custodial fair token launchpad. Multichain: **Robinhood Chain** (chainId 4663) and **Stable** (chainId 988) are supported out of the box; pick one with `new Openfair({ chainId })`. Launch tokens from your own site, app, script or AI agent; every launch made through your integration records your wallet as the **on-chain referrer**, entitling you to half of the platform's fee share for that token – forever, enforced by the contracts, not by a server.
+
+​```js
+import { Openfair } from '@openfair/sdk';
+const sdk = new Openfair({ chainId: 988 }); // Stable; omit for Robinhood Chain
+​```
 
 - **Fair Launch** — community-funded bonding curve (5 ETH target), anti-snipe, auto-listing on Uniswap V3, LP locked forever.
 - **Instant Listing** — trading starts on Uniswap V3 in the creation transaction; zero capital needed.
