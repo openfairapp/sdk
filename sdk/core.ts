@@ -11,6 +11,7 @@ import {
   type Address, type WalletClient, type PublicClient,
 } from 'viem';
 import { CHAIN, ADDR, POOL_FEE_TIER, START_FDV_ETH, TARGET_ETH, SUPPORTER_SHARE_BPS } from '../src/lib/config';
+import { NETWORKS as REGISTRY } from '../src/content/networks.mjs';
 import { factoryAbi } from '../src/lib/abi';
 
 export const SDK_VERSION = '1.1.2';
@@ -40,20 +41,24 @@ export interface ChainManifest {
   dexSwapUrl: ((token: string) => string) | null;
 }
 
-export const CHAIN_MANIFESTS: Record<number, ChainManifest> = {
-  [CHAIN.id]: {
-    chainId: CHAIN.id, hexId: CHAIN.hexId, name: CHAIN.name, testnet: false,
-    rpcUrls: [CHAIN.rpcUrl], explorer: CHAIN.explorer, currency: CHAIN.currency,
-    factoryVersion: '2.0',
+// Built from THE network registry (src/content/networks.mjs): EVERY network
+// openfair supports is a manifest here, so `new Openfair({ chainId })` can
+// target any of them – not just the chain this bundle was built for. Adding a
+// chain to the registry adds it to the SDK automatically.
+export const CHAIN_MANIFESTS: Record<number, ChainManifest> = Object.fromEntries(
+  REGISTRY.map((n) => [n.chainId, {
+    chainId: n.chainId, hexId: n.hexId, name: n.name, testnet: n.testnet,
+    rpcUrls: [n.rpcUrl], explorer: n.explorer, currency: n.currency,
+    factoryVersion: n.factoryVersion,
     contracts: {
-      factory: ADDR.factory as Address,
-      simpleTokenDeployer: ADDR.simpleTokenDeployer as Address,
-      fairTokenDeployer: ADDR.fairTokenDeployer as Address,
-      weth: ADDR.weth as Address,
+      factory: n.contracts.factory as Address,
+      simpleTokenDeployer: n.contracts.simpleTokenDeployer as Address,
+      fairTokenDeployer: n.contracts.fairTokenDeployer as Address,
+      weth: n.contracts.weth as Address,
     },
-    dexSwapUrl: (token) => `https://app.uniswap.org/swap?chain=robinhood&outputCurrency=${token}`,
-  },
-};
+    dexSwapUrl: (token: string) => `${n.dexSwapUrl}${token}`,
+  }]),
+);
 
 function chainFromManifest(m: ChainManifest) {
   return defineChain({
@@ -147,7 +152,7 @@ export interface OpenfairOptions {
   provider?: Eip1193;
   /** openfair origin for metadata pinning + links. */
   apiBase?: string;
-  /** Target chain (Robinhood Chain 4663 — the only supported network). */
+  /** Target chain (Robinhood Chain 4663 – the only supported network). */
   chainId?: number;
   /** Override / extend RPC endpoints; more than one enables fallback. */
   rpcUrls?: string[];
