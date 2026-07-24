@@ -2,7 +2,7 @@
 
 ## 1.2.0 · 2026-07-24
 
-— multichain: Stable (chainId 988)
+- multichain: Stable (chainId 988)
 
 ## 1.1.2 · 2026-07-22
 
