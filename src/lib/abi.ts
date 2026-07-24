@@ -7,7 +7,7 @@ export const launchCreatedEventAbi = parseAbi([
 export const factoryAbi = parseAbi([
   'struct CreateParams { string name; string symbol; uint256 totalSupply; uint256 saleSupply; uint8 curveType; uint256 priceMultiple; uint256 targetEth; uint16 buyFeeBps; uint16 sellFeeBps; uint16 platformShareBps; address feeRecipient; bool sellsEnabled; uint64 startTime; uint256 walletCapFloor; uint256 walletCapPerSec; uint256 globalRampPerSec; uint24 poolFeeTier; uint256 teamAllocation; address teamBeneficiary; uint64 teamVestingDuration; uint256 devBuyEth; bytes32 salt; uint256 vanityFeeWei; }',
   'function createLaunch(CreateParams p, address referrer, string metadataCID) payable returns (address, address, address)',
-  // v1.9: + referrer (instant-listing referral — half of the platform's LP-fee cut)
+  // v1.9: + referrer (instant-listing referral – half of the platform's LP-fee cut)
   'struct DirectParams { string name; string symbol; uint256 totalSupply; uint16 poolBps; address feeRecipient; uint24 poolFeeTier; uint256 startPriceWei; bytes32 salt; uint256 vanityFeeWei; uint16 platformShareBps; address referrer; }',
   'function createDirectListing(DirectParams p, string metadataCID) payable returns (address, address, address)',
   'function deployFee() view returns (uint256)',
