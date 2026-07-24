@@ -14,7 +14,7 @@ import { CHAIN, ADDR, POOL_FEE_TIER, START_FDV_ETH, TARGET_ETH, SUPPORTER_SHARE_
 import { NETWORKS as REGISTRY } from '../src/content/networks.mjs';
 import { factoryAbi } from '../src/lib/abi';
 
-export const SDK_VERSION = '1.1.2';
+export const SDK_VERSION = '1.2.0';
 
 const ZERO = '0x0000000000000000000000000000000000000000' as const;
 const ZERO_SALT = ('0x' + '0'.repeat(64)) as `0x${string}`;
