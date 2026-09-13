@@ -1,18 +1,18 @@
 // <openfair-create> – a stylable, iframe-free token-creation widget.
 // Lives in the host page's DOM: inherits its fonts, and every color/radius is
 // a CSS custom property (--of-*) the host can override.
-// Events: of-ready, of-mode-change, of-wallet-connected, of-progress,
-// of-tx-submitted, of-indexed, of-error, of-created.
+// Events: of-ready, of-mode-change, of-pair-change, of-wallet-connected,
+// of-progress, of-tx-submitted, of-indexed, of-error, of-created.
 // i18n: built-in en/ru; any string is overridable via the `dict` attribute
 // (JSON) or the `.dictionary` property.
-import { Openfair, type LaunchResult, type ProgressEvent } from './core';
+import { Openfair, type LaunchResult, type ProgressEvent, type QuoteAsset } from './core';
 
 type Lang = 'en' | 'ru';
 
 const T: Record<Lang, Record<string, string>> = {
   en: {
     modeInstant: 'Instant listing', modeFair: 'Fair launch',
-    flowInstant: 'Launch → DEX', flowFair: 'Launch → Bonding curve (5 ETH) → DEX',
+    flowInstant: 'Launch → DEX', flowFair: 'Launch → Bonding curve ({target} {cur}) → DEX',
     logo: 'Logo (optional)', name: 'Token name', ticker: 'Ticker', supply: 'Total supply',
     desc: 'Description', descPh: 'What is this token about?', optional: 'optional',
     website: 'Website', twitter: 'X / Twitter', telegram: 'Telegram',
@@ -23,10 +23,13 @@ const T: Record<Lang, Record<string, string>> = {
     errRequired: 'Fill in the token name and ticker.',
     stMetadata: 'Pinning metadata…', stSimulating: 'Simulating…', stWallet: 'Confirm in your wallet…',
     stConfirming: 'Waiting for the chain…', stIndexing: 'Indexing…',
+    pair: 'Pair with', pairNative: '{cur} – the chain coin',
+    stApproving: 'Approving {sym}…',
+    pairNote: 'Two signatures: the factory pulls {sym} from your wallet, so it asks for an approval first.',
   },
   ru: {
     modeInstant: 'Мгновенный листинг', modeFair: 'Честный запуск',
-    flowInstant: 'Запуск → DEX', flowFair: 'Запуск → Бондинг-кривая (5 ETH) → DEX',
+    flowInstant: 'Запуск → DEX', flowFair: 'Запуск → Бондинг-кривая ({target} {cur}) → DEX',
     logo: 'Логотип (необязательно)', name: 'Название токена', ticker: 'Тикер', supply: 'Общий выпуск',
     desc: 'Описание', descPh: 'О чём этот токен?', optional: 'необязательно',
     website: 'Сайт', twitter: 'X / Twitter', telegram: 'Telegram',
@@ -37,6 +40,9 @@ const T: Record<Lang, Record<string, string>> = {
     errRequired: 'Заполните название токена и тикер.',
     stMetadata: 'Загружаем метаданные…', stSimulating: 'Симулируем…', stWallet: 'Подтвердите в кошельке…',
     stConfirming: 'Ждём сеть…', stIndexing: 'Индексируем…',
+    pair: 'Пара с', pairNative: '{cur} – монета сети',
+    stApproving: 'Разрешаем списание {sym}…',
+    pairNote: 'Две подписи: фабрика списывает {sym} с вашего кошелька, поэтому сначала просит разрешение.',
   },
 };
 
@@ -62,12 +68,13 @@ const STYLE = `
 .mode small { display: block; opacity: .6; font-size: 10.5px; margin-top: 3px; }
 .mode.sel { border-color: var(--of-accent, #f6b23c); background: var(--of-accent-wash, rgba(246,178,60,.09)); }
 label { display: block; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; opacity: .65; margin: 12px 0 5px; }
-input, textarea {
+input, textarea, select {
   width: 100%; background: var(--of-field-bg, #211a29); color: inherit;
   border: 1px solid var(--of-border, #2c2434); border-radius: calc(var(--of-radius, 16px) * .5);
   padding: 10px 12px; font: inherit; font-size: 14px;
 }
-input:focus, textarea:focus { outline: 2px solid var(--of-accent, #f6b23c); outline-offset: 1px; }
+input:focus, textarea:focus, select:focus { outline: 2px solid var(--of-accent, #f6b23c); outline-offset: 1px; }
+.hint { font-size: 11.5px; opacity: .6; margin-top: 6px; }
 .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
 @media (max-width: 480px) { .row, .row3 { grid-template-columns: 1fr; } }
@@ -121,10 +128,15 @@ export class OpenfairCreateElement extends HTMLElementBase {
   private lastForm = { name: '', symbol: '', description: '', website: '', twitter: '', telegram: '', supply: 1_000_000_000 };
   private error = '';
   private stageText = '';
+  // Quote pairs: empty on a chain without a registry, which is every chain the
+  // widget could target before 1.3.0 – then nothing below renders and the
+  // launch is native, exactly as it was.
+  private pairs: QuoteAsset[] = [];
+  private pair = ''; // '' = the chain's native coin
   /** Custom translation overrides (also settable via the `dict` attribute as JSON). */
   dictionary: Partial<Record<string, string>> | null = null;
 
-  static get observedAttributes() { return ['ref', 'lang', 'mode', 'api-base', 'dict']; }
+  static get observedAttributes() { return ['ref', 'lang', 'mode', 'pair', 'api-base', 'dict']; }
 
   private fire(name: string, detail?: unknown) {
     this.dispatchEvent(new CustomEvent(name, { bubbles: true, composed: true, detail }));
@@ -135,15 +147,51 @@ export class OpenfairCreateElement extends HTMLElementBase {
     this.sdk = new Openfair({ referrer: this.getAttribute('ref') ?? undefined, apiBase });
     const m = this.getAttribute('mode');
     if (m === 'fair' || m === 'instant') this.mode = m;
+    this.pair = this.getAttribute('pair') ?? '';
     this.attachShadow({ mode: 'open' });
     this.render();
     this.fire('of-ready', { mode: this.mode });
+    this.refreshFee();
+    // The allow-list, when the target chain has one. A failure here is not the
+    // user's problem: the widget keeps working as a native-only form.
+    this.sdk.quotes.list().then((items) => {
+      // All THREE registry figures, because quotes.require() throws
+      // QuotePriceStale when any one of them is null – offering a pair the
+      // launch would then abort on is worse than not offering it.
+      this.pairs = items.filter((q) => q.enabled
+        && q.deployFeeWei !== null && q.targetWei !== null && q.startFdvWei !== null);
+      if (this.pair && !this.pairs.some((q) => q.address.toLowerCase() === this.pair.toLowerCase())) this.pair = '';
+      if (this.pairs.length) { this.refreshFee(); this.render(); }
+    }).catch(() => {});
+  }
+
+  /** The selected pair, or null while the launch is native. */
+  private selected(): QuoteAsset | null {
+    const want = this.pair.toLowerCase();
+    return this.pairs.find((q) => q.address.toLowerCase() === want) ?? null;
+  }
+
+  /** Fee line under the button, in the unit the launch actually pays in. */
+  private refreshFee() {
+    const t = this.t();
+    const lang = (this.getAttribute('lang') as Lang) ?? 'en';
+    const fmt = (wei: bigint, decimals: number) => new Intl.NumberFormat(
+      lang === 'ru' ? 'ru-RU' : 'en-US', { maximumFractionDigits: 6 },
+    ).format(Number(wei) / 10 ** decimals);
+    const qa = this.selected();
+    if (qa) {
+      // The registry's fee, discounted by the same supporter rule the factory
+      // applies to it – read from the factory, never assumed to be half.
+      this.sdk.supporterFeeBps().then((bps) => {
+        const fee = qa.deployFeeWei! * BigInt(bps) / 10000n;
+        this.feeText = fee === 0n ? `${t.fee}: ${t.free}` : `${t.fee}: ${fmt(fee, qa.decimals)} ${esc(qa.symbol ?? '')}`;
+        this.render();
+      }).catch(() => {});
+      return;
+    }
     this.sdk.fees().then(({ supporterFeeWei }) => {
-      const t = this.t();
       const cur = this.sdk.manifest.currency.symbol;
-      const lang = (this.getAttribute('lang') as Lang) ?? 'en';
-      const amount = new Intl.NumberFormat(lang === 'ru' ? 'ru-RU' : 'en-US', { maximumFractionDigits: 6 }).format(Number(supporterFeeWei) / 1e18);
-      this.feeText = supporterFeeWei === 0n ? `${t.fee}: ${t.free}` : `${t.fee}: ${amount} ${cur}`;
+      this.feeText = supporterFeeWei === 0n ? `${t.fee}: ${t.free}` : `${t.fee}: ${fmt(supporterFeeWei, 18)} ${cur}`;
       this.render();
     }).catch(() => {});
   }
@@ -153,7 +201,13 @@ export class OpenfairCreateElement extends HTMLElementBase {
     let attrDict: Record<string, string> | null = null;
     const raw = this.getAttribute('dict');
     if (raw) { try { attrDict = JSON.parse(raw); } catch { /* malformed dict attr – ignore */ } }
-    return { ...base, ...(attrDict ?? {}), ...(this.dictionary ?? {}) } as Record<string, string>;
+    const merged = { ...base, ...(attrDict ?? {}), ...(this.dictionary ?? {}) } as Record<string, string>;
+    // AUDIT L-5: labels land in innerHTML in a dozen places. Custom dictionaries
+    // come from the host page (attribute or property), so they are escaped once
+    // here rather than at every interpolation site.
+    const safe: Record<string, string> = {};
+    for (const [k, v] of Object.entries(merged)) safe[k] = esc(String(v));
+    return safe;
   }
   private modeLocked() { const m = this.getAttribute('mode'); return m === 'fair' || m === 'instant'; }
 
@@ -163,10 +217,13 @@ export class OpenfairCreateElement extends HTMLElementBase {
     if (!f.name.trim() || !f.symbol.trim()) { this.error = t.errRequired; this.render(); return; }
     this.busy = true; this.error = ''; this.stageText = ''; this.render();
     try {
+      const qa = this.selected();
       const common = {
         name: f.name.trim(), symbol: f.symbol.trim().toUpperCase().slice(0, 8),
         totalSupply: f.supply, description: f.description.trim(), logoDataUrl: this.logoDataUrl,
         website: f.website.trim(), twitter: f.twitter.trim(), telegram: f.telegram.trim(),
+        // Omitted entirely when native, so the params keep the pre-1.3.0 shape.
+        ...(qa ? { quote: qa.address } : {}),
       };
       const wasConnected = !!this.sdk.account;
       const onProgress = (e: ProgressEvent) => {
@@ -177,6 +234,7 @@ export class OpenfairCreateElement extends HTMLElementBase {
         }
         this.stageText = ({
           preparing_metadata: t.stMetadata, simulating: t.stSimulating, awaiting_wallet: t.stWallet,
+          approving: t.stApproving.replace('{sym}', esc(qa?.symbol ?? '')),
           transaction_submitted: t.stConfirming, confirming: t.stConfirming, indexing: t.stIndexing,
         } as Record<string, string>)[e.stage] ?? '';
         this.render();
@@ -216,10 +274,10 @@ export class OpenfairCreateElement extends HTMLElementBase {
       sh.innerHTML = `<style>${STYLE}</style>
         <div class="card" part="card">
           <div style="font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--of-accent,#f6b23c);margin-bottom:10px">${t.created}</div>
-          ${this.logoDataUrl ? `<img src="${this.logoDataUrl}" alt="">` : ''}
+          ${this.logoDataUrl ? `<img src="${attr(this.logoDataUrl)}" alt="${attr(f.name)} logo">` : ''}
           <h3>${esc(f.name)} <span class="sym">$${esc(f.symbol.toUpperCase())}</span></h3>
           ${f.description ? `<p>${esc(f.description)}</p>` : ''}
-          ${r.token ? `<button class="addr" part="address" id="copy">${r.token} ⧉</button>` : ''}
+          ${r.token ? `<button class="addr" part="address" id="copy">${esc(r.token)} ⧉</button>` : ''}
           <div class="btns">
             ${r.uniswapUrl ? `<a class="btn-secondary" part="button-secondary" href="${r.uniswapUrl}" target="_blank" rel="noreferrer">${t.trade} ↗</a>` : ''}
             <a class="btn-primary" part="button-primary" href="${r.openfairUrl}" target="_blank" rel="noreferrer">${t.open} ↗</a>
@@ -233,12 +291,30 @@ export class OpenfairCreateElement extends HTMLElementBase {
       });
       return;
     }
+    // Curve target in the launch's own unit: a pair's target comes from the
+    // registry's USD anchor, not from the chain's economics.
+    const qa = this.selected();
+    const unit = qa ? esc(qa.symbol ?? short(qa.address)) : this.sdk.manifest.currency.symbol;
+    const target = qa && qa.targetWei !== null
+      ? String(+(Number(qa.targetWei) / 10 ** qa.decimals).toFixed(4))
+      : String(this.sdk.manifest.economics.target);
     sh.innerHTML = `<style>${STYLE}</style>
       ${this.modeLocked() ? '' : `
       <div class="modes" part="modes">
-        <button class="mode ${this.mode === 'fair' ? 'sel' : ''}" id="m-fair" part="mode">${t.modeFair}<small>${t.flowFair}</small></button>
+        <button class="mode ${this.mode === 'fair' ? 'sel' : ''}" id="m-fair" part="mode">${t.modeFair}<small>${t.flowFair
+          .replace('{target}', target)
+          .replace('{cur}', unit)}</small></button>
         <button class="mode ${this.mode === 'instant' ? 'sel' : ''}" id="m-instant" part="mode">${t.modeInstant}<small>${t.flowInstant}</small></button>
       </div>`}
+      ${this.pairs.length && !this.getAttribute('pair') ? `
+      <label part="label" for="pair">${t.pair}</label>
+      <select part="input" id="pair">
+        <option value=""${this.pair ? '' : ' selected'}>${t.pairNative.replace('{cur}', this.sdk.manifest.currency.symbol)}</option>
+        ${this.pairs.map((q) => `<option value="${attr(q.address)}"${q.address === this.pair ? ' selected' : ''}>${esc(q.symbol ?? short(q.address))}${
+          q.priceUsd != null ? ` · $${esc(q.priceUsd.toLocaleString('en-US', { maximumFractionDigits: 2 }))}` : ''
+        }</option>`).join('')}
+      </select>
+      ${qa ? `<div class="hint" part="hint">${t.pairNote.replace('{sym}', unit)}</div>` : ''}` : ''}
       <label part="label">${t.logo}</label>
       <div class="logo-drop" id="logodrop" part="logo">
         ${this.logoDataUrl ? `<img src="${this.logoDataUrl}" alt="">` : '⬆'}
@@ -269,6 +345,12 @@ export class OpenfairCreateElement extends HTMLElementBase {
       });
     };
     (['name', 'symbol', 'supply', 'description', 'website', 'twitter', 'telegram'] as const).forEach(bind);
+    sh.getElementById('pair')?.addEventListener('change', (ev) => {
+      this.pair = (ev.target as HTMLSelectElement).value;
+      this.fire('of-pair-change', { quote: this.pair || null, symbol: this.selected()?.symbol ?? null });
+      this.refreshFee();
+      this.render();
+    });
     sh.getElementById('m-fair')?.addEventListener('click', () => { this.mode = 'fair'; this.fire('of-mode-change', { mode: 'fair' }); this.render(); });
     sh.getElementById('m-instant')?.addEventListener('click', () => { this.mode = 'instant'; this.fire('of-mode-change', { mode: 'instant' }); this.render(); });
     sh.getElementById('go')?.addEventListener('click', () => this.submit());
@@ -279,6 +361,16 @@ export class OpenfairCreateElement extends HTMLElementBase {
   }
 }
 
+// AUDIT L-5: every value interpolated into innerHTML goes through esc() (text)
+// or attr() (attribute context). The widget renders on PARTNER domains, so even
+// self-inflicted markup from the host page's `dict` must not become executable.
+function attr(s: string): string {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
+}
+
 function esc(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 }
+
+/** Fallback label for a quote asset the registry lists without a symbol. */
+function short(a: string): string { return `${a.slice(0, 6)}…${a.slice(-4)}`; }

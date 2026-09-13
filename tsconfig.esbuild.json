@@ -1,0 +1,8 @@
+{
+  // Read by esbuild only – the build scripts pass --tsconfig=tsconfig.esbuild.json;
+  // tsc (declarations) uses tsconfig.json. Deliberately free of `target` and
+  // `strict`: that is what esbuild sees where the published @openfair/sdk build is
+  // made, and it is what keeps the bundles byte-identical to it – class fields with
+  // define semantics, no "use strict" directive in the CJS / IIFE outputs.
+  "compilerOptions": {}
+}

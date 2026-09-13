@@ -9,6 +9,19 @@ info:
     POST endpoints that compute (quote/simulate) are rate-limited (RateLimit-* headers).
     Policy: launches prepared via this API carry platformShareBps ≥ 1500 (15%);
     5000+ grants Supporter status (creation is free).
+    Pairing: a launch is priced either in the chain's native coin (`quote: null`, the
+    only case before factory v3) or in an allow-listed ERC-20 quote asset (GET /quotes).
+    For a quote-paired launch every amount of that launch – fee, target, curve prices,
+    trade volumes, referral accruals – is in the asset's base units; gas is always native.
+    Modes: `fair` (bonding curve), `instant` (listed on Uniswap from block one) and
+    `crowd` – a RAISE, which collects money against fixed on-chain terms and then either
+    settles into a token plus a locked pool, or fails and refunds. Crowd rows are NOT in
+    the catalogue by default and never will be: GET /tokens returns them only for
+    `mode=crowd` or one of the raise statuses (`raising`, `succeeded`, `failed`,
+    `written_off`), so every filter that existed before crowd – `status=graduated`,
+    `status=dex`, `mode=fair`, `mode=instant`, `status=curve` – keeps the exact answer it
+    always gave. GET /crowd/{token} is the raise itself, and openfair publishes no trust
+    score for one.
   contact: { url: "https://openfair.app" }
 servers:
   - url: https://openfair.app/api/v1
@@ -49,9 +62,16 @@ components:
         address: { type: string }
         name: { type: string }
         symbol: { type: string }
-        mode: { type: string, enum: [fair, instant] }
-        status: { type: string, enum: [curve, graduated, dex] }
-        contractVersion: { type: string }
+        mode: { type: string, enum: [fair, instant, crowd] }
+        status:
+          type: string
+          enum: [curve, graduated, dex, raising, succeeded, failed, written_off]
+          description: >-
+            The last four are raise states. `written_off` is TERMINAL: the pool reserve was
+            released to the escrow, so no pool will ever exist, the token stays
+            non-transferable and claims can never pay – redemption is the only path left.
+            `dex` on a raise means its pool has been seeded.
+        contractVersion: { type: string, description: "'crowd-1.0' for a raise; CrowdFactory is deliberately not part of the launch factory version series" }
         creator: { type: string }
         referrer: { type: [string, "null"] }
         totalSupplyWei: { type: string }
@@ -59,14 +79,317 @@ components:
         createdAtUnix: { type: integer }
         graduated: { type: boolean }
         pool: { type: [string, "null"] }
+        quote:
+          description: "asset the launch trades against; null = the chain's native coin"
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/QuoteRef"
         marketCapUsd: { type: [number, "null"] }
+        usdStale:
+          type: [boolean, "null"]
+          description: "quote launches: the feed price is older than 4 days or unreadable. null = native launch (no feed involved)"
+        quoteFrozen:
+          type: boolean
+          description: "the freeze watch last saw this launch's quote asset frozen (issuer pause or blocklist) – buys and sells revert while it is true; always false on a native launch"
+        quoteFrozenSince: { type: [string, "null"], format: date-time }
         logoUrl: { type: [string, "null"] }
+        trustScore:
+          type: [integer, "null"]
+          description: >-
+            0-100, on-chain facts only (GET /tokens/{address} only). ALWAYS null for a
+            crowd launch: rating somebody else's fundraise is a recommendation, so the
+            five-point terms checklist in `crowd.checklist` stands in its place.
+        crowd:
+          description: "present only on mode=crowd: the raise, straight from the index (no chain read per row)"
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/CrowdSummary"
         urls:
           type: object
           properties:
             openfair: { type: string }
             explorer: { type: string }
-            dex: { type: [string, "null"] }
+            dex: { type: [string, "null"], description: "null for a raise until its pool is seeded" }
+            crowd: { type: string, description: "the campaign page; present on mode=crowd only" }
+    QuoteRef:
+      type: object
+      description: An ERC-20 a launch is paired with (a tokenised stock on Robinhood Chain).
+      properties:
+        address: { type: string }
+        symbol: { type: [string, "null"] }
+        decimals: { type: [integer, "null"], description: "18 for every v1 quote asset" }
+        feed: { type: [string, "null"], description: "Chainlink AggregatorV3 used for the USD figures" }
+    QuoteAsset:
+      allOf:
+        - $ref: "#/components/schemas/QuoteRef"
+        - type: object
+          properties:
+            enabled: { type: boolean }
+            priceUsd: { type: [number, "null"] }
+            updatedAt: { type: [string, "null"], format: date-time }
+            updatedAtUnix: { type: [integer, "null"] }
+            stale: { type: boolean, description: "price older than 4 days (MAX_PRICE_AGE) or unreadable" }
+            deployFeeWei: { type: [string, "null"], description: "creation fee in quote base units; null while the feed is stale (creation would revert)" }
+            targetWei: { type: [string, "null"] }
+            startFdvWei: { type: [string, "null"] }
+            crowd:
+              description: "what a CROWD raise in this asset costs and is bound by – the same tuple GET /crowd/terms returns, so an asset picker needs no request per asset. null where crowd launches are off on this chain."
+              oneOf:
+                - type: "null"
+                - $ref: "#/components/schemas/CrowdTerms"
+    QuoteAssetList:
+      type: object
+      properties:
+        registry: { type: [string, "null"], description: "QuoteRegistry address; null = quote pairs are off on this chain (items is then empty)" }
+        items: { type: array, items: { $ref: "#/components/schemas/QuoteAsset" } }
+    ZapQuote:
+      type: object
+      description: >-
+        One priced route into (or out of) a quote-paired launch, plus the unsigned call.
+        Paying ETH goes through OpenZap – WETH -> quote on a Uniswap V3 pool, then the
+        curve, in one transaction; paying the quote asset directly skips the pool leg.
+        Every *Wei is base units: ETH figures are native wei, quote figures are the quote
+        asset's units, token figures are 18-decimal.
+      properties:
+        launch: { type: string }
+        token: { type: string }
+        symbol: { type: [string, "null"] }
+        zap: { type: [string, "null"], description: "OpenZap address the tx is sent to on the ETH route; null on the direct route, which needs no zap" }
+        quote: { $ref: "#/components/schemas/QuoteRef" }
+        direction: { type: string, enum: [buy, sell] }
+        payWith:
+          type: string
+          enum: [eth, quote]
+          description: "the ETH-denominated side: what is paid on a buy, what is received on a sell"
+        poolFee: { type: [integer, "null"], description: "fee tier of the WETH/quote pool (500|3000|10000); null on the direct route" }
+        pools:
+          type: array
+          description: every tier that quoted for this size, deepest first pick
+          items:
+            type: object
+            properties:
+              fee: { type: integer }
+              amountOutWei: { type: string }
+        slippageBps: { type: integer, description: "per leg; default 100 (1%)" }
+        ethInWei: { type: [string, "null"] }
+        quoteInWei: { type: [string, "null"] }
+        tokensInWei: { type: [string, "null"] }
+        quoteOutWei: { type: string, description: "pool output on a buy, curve payout on a sell" }
+        tokensOutWei: { type: [string, "null"] }
+        ethOutWei: { type: [string, "null"] }
+        minQuoteOutWei: { type: string, description: "floor for the leg that produces the quote asset" }
+        minTokensOutWei: { type: [string, "null"], description: "curve floor on a buy – the pool and curve haircuts compound" }
+        minEthOutWei: { type: [string, "null"], description: "pool floor on an ETH sell – compounded the same way" }
+        priceImpactBps:
+          type: [integer, "null"]
+          description: >-
+            Depth cost of the pool leg: this size's rate against a 1% slice of it on the
+            same pool. null on the direct route or when the slice is too small to quote.
+            The curve leg has no impact notion – its price is a published function of how
+            much has been sold.
+        curveRemainingTokensWei:
+          type: [string, "null"]
+          description: "tokens the curve still has to sell; null when the launch did not answer"
+        fillsCurve:
+          type: boolean
+          description: >-
+            true when this input would take everything the curve has left. OpenLaunch caps
+            the fill and refunds the overpayment in the QUOTE asset – straight to the buyer,
+            never back through the zap as ETH – so send suggestedEthInWei/suggestedQuoteInWei
+            instead to be left holding only what was asked for.
+        suggestedEthInWei: { type: [string, "null"], description: "ETH input that fills the curve exactly; null unless fillsCurve" }
+        suggestedQuoteInWei: { type: [string, "null"], description: "quote input that fills the curve exactly; null unless fillsCurve" }
+        quotedAt:
+          type: string
+          description: >-
+            ISO time the OLDER of the two legs was read on-chain. The pool leg is cached 10 s,
+            the curve leg 2 s; age the floors against this, not against when the body arrived.
+        deadline: { type: integer, description: "unix seconds, suggested – forwarded to the router" }
+        deadlineSeconds: { type: integer }
+        tx:
+          type: object
+          description: unsigned call for the user's wallet; this API never signs
+          properties:
+            description: { type: string }
+            to: { type: string }
+            data: { type: string }
+            valueWei: { type: string }
+        approveTx:
+          description: "the approve that must land first; null when nothing is pulled from the caller (buying with ETH)"
+          oneOf:
+            - type: "null"
+            - type: object
+              properties:
+                description: { type: string }
+                to: { type: string }
+                data: { type: string }
+                valueWei: { type: string }
+        warnings: { type: array, items: { type: string } }
+    CrowdSummary:
+      type: object
+      description: >-
+        The compact raise block every list item and card carries. Every field comes out of
+        the index, so a page of 24 cards makes no chain call at all. On GET
+        /tokens/{address} it additionally carries floorPerTokenWei and checklist.
+      properties:
+        phase: { type: string, enum: [raising, failed, succeeded], description: "the contract's own phase; see `status` for the five catalogue states" }
+        raisedWei: { type: string }
+        hardCapWei: { type: string }
+        softCapWei: { type: string, description: "below it at settlement the raise FAILS and refunds; measured without the creator side's own money" }
+        contributorCount: { type: integer }
+        deadlineEffective: { type: [string, "null"], format: date-time, description: "an observed issuer freeze pushes this out by 3 days from when it was seen, capped at 30 days past the announced deadline" }
+        poolSeeded: { type: boolean }
+        poolWrittenOff: { type: boolean }
+        floorPerTokenWei: { type: [string, "null"], description: "redemption floor right now – it DECAYS to zero as the author's escrow matures" }
+        checklist:
+          type: object
+          properties: { passed: { type: integer }, total: { type: integer } }
+    CrowdTerms:
+      type: object
+      description: >-
+        What creating a raise in one asset costs and is bound by right now. `available:
+        false` is a STATE, not an error: `termsFor` reverts exactly where a creation would
+        (a stale equity feed on a weekend, an asset the registry does not allow-list).
+      properties:
+        quote: { type: [string, "null"], description: "null = the chain's native coin" }
+        createFeeWei: { type: [string, "null"], description: "escrowed INSIDE the raise and refunded to the creator if it fails" }
+        minContributionWei: { type: [string, "null"], description: "the dust floor a raise's own minimum may not go below" }
+        feeCapWei: { type: [string, "null"], description: "absolute ceiling on the platform's cut of the author's payouts" }
+        volatile: { type: [boolean, "null"] }
+        maxDurationDays: { type: [integer, "null"], description: "14 for a volatile quote asset, 60 otherwise" }
+        raiseFeeBps: { type: [integer, "null"] }
+        platformShareBps: { type: [integer, "null"] }
+        available: { type: boolean }
+        reason: { type: [string, "null"], enum: [stale_price, quote_not_allowed, null] }
+    CrowdDetail:
+      type: object
+      description: >-
+        One raise in full. There is no trustScore field by design. Every *Wei is the base
+        unit of the asset the raise collects – the chain's native coin when `quote` is null.
+      properties:
+        address: { type: string, description: "the token" }
+        crowd: { type: string, description: "the OpenCrowd contract every action is sent to" }
+        harvester: { type: [string, "null"] }
+        creator: { type: string }
+        referrer: { type: [string, "null"] }
+        feeRecipient: { type: string, description: "who the author's escrow pays; one of the three creator-side addresses" }
+        teamBeneficiary: { type: [string, "null"] }
+        metadataCID: { type: [string, "null"] }
+        metadata:
+          type: object
+          description: >-
+            The creator's statements are served from a mutable store while the binding is
+            the immutable CrowdParams.metadataHash – so the server hashes the bytes it
+            serves and reports whether they agree. `matches: false` means the served text
+            is NOT what was signed on-chain. Addenda have no on-chain hash of their own,
+            so their `matches` is always null.
+          properties:
+            hash: { type: [string, "null"] }
+            servedHash: { type: [string, "null"] }
+            matches: { type: [boolean, "null"] }
+            addenda:
+              type: array
+              items:
+                type: object
+                properties: { cid: { type: string }, ts: { type: [string, "null"], format: date-time }, matches: { type: "null" } }
+        phase: { type: string, enum: [raising, failed, succeeded] }
+        status: { type: string, enum: [raising, succeeded, dex, failed, written_off] }
+        reason: { type: [string, "null"], enum: [cancelled, abandoned, softCapMissed, poolWrittenOff, null] }
+        quote:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/QuoteRef"
+        terms:
+          type: object
+          description: "immutable, from the creation event – the raise cannot change any of it"
+        clock:
+          type: object
+          description: "deadline, its announced original, the effective one, and the moments withdraw/settle/abandon open"
+        progress:
+          type: object
+          description: >-
+            `eligibleRaisedWei` excludes the creator side's own money, which is what the
+            soft cap is measured on; that side is capped at 10 % of the hard cap.
+        supply:
+          type: object
+          description: >-
+            `basis` is 'settled' (facts from the settlement) or 'hardCap' (the same
+            arithmetic projected at a full raise). `participantShareBps` is the
+            participants' share of what SURVIVES the settlement burn – it is higher than
+            crowdTokensBps, which only sizes the derived supply.
+        settlement: { type: object }
+        escrow:
+          type: object
+          description: >-
+            `releasableWei` – not authorPotWei – is what the author's release button is
+            gated on. `solvencyBps` below 10000 means the quote's issuer burned into this
+            contract: every exit pays that fraction and the rest is LOST, not deferred, and
+            neither withdraw nor refund has a minimum-out to protect against it.
+            `floorZeroAt` is the date the redemption floor reaches zero.
+        checklist:
+          type: object
+          description: >-
+            The five published terms checks, thresholds and all: poolBps >= 3000; author
+            vesting >= 90 days; a redemption escrow exists at all; team tokens <= 1000 bps
+            AND <= half of crowdTokensBps; a per-wallet cap of at most 5 % of the hard cap.
+          properties:
+            poolBps: { type: boolean }
+            vesting: { type: boolean }
+            redeem: { type: boolean }
+            teamTokens: { type: boolean }
+            walletCap: { type: boolean }
+            passed: { type: integer }
+            total: { type: integer }
+        indexedThroughBlock: { type: integer }
+        updatedAt: { type: string, format: date-time }
+    CrowdParticipant:
+      type: object
+      description: >-
+        One wallet's position in a raise, and a MACHINE-readable reason for every action it
+        cannot take – six different reverts stand behind `contribute` alone, and a page
+        that guesses can only show "gas estimation failed" after the user signs.
+      properties:
+        address: { type: string }
+        crowd: { type: string }
+        account: { type: string }
+        contributionWei: { type: string }
+        entitlementWei: { type: string }
+        claimableWei: { type: string }
+        claimedWei: { type: string }
+        redeemedWei: { type: string }
+        refundClaimed: { type: boolean }
+        parkedWei: { type: string }
+        parkedSource: { type: string, enum: [crowd], description: "released with claimParked(to) on the raise, never on the harvester" }
+        isCreatorSide: { type: boolean, description: "creator, feeRecipient or teamBeneficiary – their money never counts toward the soft cap and is capped at 10 % of the hard cap" }
+        allowlisted: { type: [boolean, "null"], description: "null = the raise has an allowlist and the server holds no merkle tree; check your own proof" }
+        maxAcceptableWei: { type: string, description: "min(room left, per-wallet room, creator-side room) – clamp the amount field to it" }
+        solvencyBps: { type: integer }
+        can:
+          type: object
+          properties:
+            contribute: { type: boolean }
+            withdraw: { type: boolean }
+            claim: { type: boolean }
+            redeem: { type: boolean }
+            refund: { type: boolean }
+            release: { type: boolean }
+        blockedBy:
+          type: object
+          description: >-
+            null where the action is possible. contribute: notRaising, closed, frozen,
+            capFilled, selfCap, walletCap, belowMin, entitlementFloor (notAllowlisted is
+            the client's own proof check). withdraw: notRaising, nothing, withdrawLock,
+            shortfall. claim: notSucceeded, poolWrittenOff, poolNotSeeded, claimDelay,
+            nothing. redeem: notSucceeded, nothing, beyondEntitlement. refund: notFailed,
+            alreadyRefunded, nothing, shortfall. release: notSucceeded, nothingVested,
+            poolWrittenOff.
+          properties:
+            contribute: { type: [string, "null"] }
+            withdraw: { type: [string, "null"] }
+            claim: { type: [string, "null"] }
+            redeem: { type: [string, "null"] }
+            refund: { type: [string, "null"] }
+            release: { type: [string, "null"] }
     TokenList:
       type: object
       properties:
@@ -77,13 +400,43 @@ components:
       type: object
       properties:
         quoteId: { type: string }
-        configHash: { type: string }
-        mode: { type: string, enum: [fair, instant] }
-        factory: { type: string }
-        deployFeeWei: { type: string }
+        configHash:
+          type: string
+          description: >-
+            Opaque digest of the prepared call, for matching a quote to the session and
+            simulation it produced. Compare it, never re-derive it: the hashed shape follows
+            the deployed factory's parameter tuple and is not stable across backend or
+            factory releases.
+        mode: { type: string, enum: [fair, instant, crowd] }
+        factory: { type: string, description: "the contract the prepared call goes to – CrowdFactory for mode=crowd, LaunchFactory otherwise" }
+        quote:
+          description: "quote asset of the prepared launch; null = native"
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/QuoteRef"
+        deployFeeWei: { type: string, description: "quote base units when `quote` is set, native wei otherwise" }
         supporterDiscountWei: { type: string }
-        gasEstimateWei: { type: string, description: "includes a +20% safety multiplier" }
-        requiredValueWei: { type: string }
+        gasEstimateWei: { type: string, description: "native wei, always; includes a +20% safety multiplier" }
+        requiredValueWei: { type: string, description: "native coin sent with the create call – 0 in quote mode" }
+        requiredQuoteWei: { type: string, description: "pulled by the factory via transferFrom – 0 in native mode" }
+        approveAmountWei:
+          type: string
+          description: >-
+            what approveTx approves: requiredQuoteWei + 1%. The factory recomputes the
+            USD-anchored fee from the live feed when the create executes, so an allowance
+            of exactly requiredQuoteWei can fall short after a price tick.
+        allowanceWei: { type: [string, "null"] }
+        approvalNeeded: { type: boolean, description: "allowance < approveAmountWei" }
+        approveTx:
+          description: "unsigned approve(factory, approveAmountWei); send before the create call"
+          oneOf:
+            - type: "null"
+            - type: object
+              properties:
+                description: { type: string }
+                to: { type: string }
+                data: { type: string }
+                valueWei: { type: string }
         estimatedTotalWei: { type: string }
         platformShareBps: { type: integer, minimum: 1500 }
         referralShareBps: { type: integer }
@@ -95,12 +448,18 @@ components:
         success: { type: boolean }
         blockNumber: { type: string }
         estimatedGas: { type: [string, "null"] }
-        requiredBalanceWei: { type: string }
+        requiredBalanceWei: { type: string, description: "native: value + gas headroom (gas headroom alone in quote mode)" }
         creatorBalanceWei: { type: string }
+        requiredQuoteWei: { type: string }
+        approveAmountWei: { type: string, description: "the allowance the quote_allowance check requires (requiredQuoteWei + 1%)" }
+        creatorQuoteBalanceWei: { type: [string, "null"] }
+        quoteAllowanceWei: { type: [string, "null"] }
+        approvalNeeded: { type: boolean }
         configHash: { type: string }
         contractReason: { type: [string, "null"] }
         checks:
           type: array
+          description: "network, fee_freshness, self_referral, balance, contract_call; quote launches add quote_balance and quote_allowance"
           items:
             type: object
             properties:
@@ -116,14 +475,86 @@ components:
         configHash: { type: string }
         handoffUrl: { type: string }
         requiresWalletApproval: { type: boolean, const: true }
+        quote:
+          type: object
+          description: the frozen quote the user reviews on the handoff page
+          properties:
+            requiredValueWei: { type: string }
+            requiredQuoteWei: { type: string, description: "0 in native mode; otherwise the amount the factory pulls after the approve" }
+            approveQuoteWei: { type: string, description: "the amount the approve step must ask for (requiredQuoteWei + 1% feed headroom)" }
+            quote:
+              description: "quote asset of the frozen launch; null = native"
+              oneOf:
+                - type: "null"
+                - $ref: "#/components/schemas/QuoteRef"
+            configHash: { type: string }
+            factory: { type: string }
+            chainId: { type: integer }
         expiresAt: { type: string, format: date-time }
         txHash: { type: [string, "null"] }
         token: { type: [string, "null"] }
+    Reward:
+      type: object
+      description: Claimable referral fees of one launch, in the asset THAT launch is priced in.
+      properties:
+        token: { type: string }
+        symbol: { type: string }
+        launch: { type: string }
+        claimableWei: { type: string, description: "base units of `quote` when set, native wei otherwise – never add rows of different assets together" }
+        quote:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/QuoteRef"
+    ReferrerSummary:
+      type: object
+      properties:
+        referrer: { type: string }
+        tokensLaunched: { type: integer }
+        fairLaunches: { type: integer }
+        instantLaunches: { type: integer }
+        claimableWei: { type: string, description: "flat sum across every referred launch (pre-quote-pairs field; use claimableByUnit when assets can differ)" }
+        claimableByUnit:
+          type: array
+          description: claimable totals split by the asset they are claimable in
+          items:
+            type: object
+            properties:
+              unit: { type: string, description: "quote symbol, or the chain's native currency symbol" }
+              decimals: { type: integer }
+              claimableWei: { type: string }
+              quote:
+                oneOf:
+                  - type: "null"
+                  - $ref: "#/components/schemas/QuoteRef"
+        claimNote: { type: string }
 paths:
+  /networks:
+    get:
+      tags: [public]
+      summary: Every openfair network and its integration endpoints (cached 10 min)
+      description: |
+        Per network: chain params, currency, explorer, the API/SDK/MCP/embed endpoints,
+        economics, and `contracts` – `launchFactory`, `factoryVersion`, `registry`
+        (the QuoteRegistry address, null where quote pairs are off) and `zap`
+        (OpenZap, null where buying a quote-paired launch with ETH is not available).
+        `current` is the chainId this deployment serves.
+      responses: { "200": { description: OK } }
   /config:
     get:
       tags: [public]
       summary: Network & contract configuration (ETag, cached 5 min)
+      description: |
+        `contracts.registry` is the QuoteRegistry (null = quote pairs off on this chain)
+        and `features.quotePairs` mirrors it; `economics` is denominated in the native
+        coin – a quote-paired launch takes its fee/target/start FDV from GET /quotes.
+        `contracts.zap` is OpenZap and `features.payWithEth` mirrors it: with both set,
+        a quote-paired launch can be bought with ETH in one call (GET /zap-quote);
+        null/false means buyers need the quote asset itself. `contracts.swapRouter` and
+        `contracts.quoter` are the Uniswap V3 periphery those routes are priced against.
+        `contracts.crowdFactory` and `features.crowdLaunch` mirror each other the same way:
+        with them set, raises can be CREATED here (POST /launches/quote with mode=crowd).
+        Existing raises are indexed and served either way – the flag governs creation and
+        the storefront, not the data.
       responses:
         "200": { description: OK }
         "304": { description: Not modified }
@@ -132,26 +563,235 @@ paths:
       tags: [public]
       summary: Live creation fees (validUntil in payload)
       responses: { "200": { description: OK } }
+  /quotes:
+    get:
+      tags: [public]
+      summary: Quote assets a launch may be paired with (registry enumeration, cached 60 s)
+      description: |
+        Empty list on a chain without a QuoteRegistry. Prices come from the asset's
+        Chainlink feed; deployFeeWei/targetWei/startFdvWei are the platform's
+        USD-anchored economics converted into the asset and are null while the
+        feed is stale (a creation would revert then).
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/QuoteAssetList" } } } }
+  /zap-quote:
+    get:
+      tags: [compute]
+      summary: Price an ETH buy/sell of a quote-paired launch (pool leg cached 10 s, curve leg 2 s)
+      description: |
+        Both routes into a launch that is paired with an ERC-20 quote asset:
+        paying ETH (OpenZap – WETH -> quote on the deepest of the 500/3000/10000
+        pools, then the curve, one transaction) or paying/receiving the quote asset
+        directly. Returns the amounts, the floors for both legs, the pool leg's price
+        impact, a deadline suggestion and UNSIGNED calldata; this API never signs.
+        Pass exactly one of `ethIn`, `quoteIn`, `tokensIn` – amounts are base units
+        (wei) as decimal strings. Curve phase only: a graduated launch or an instant
+        listing trades on Uniswap and needs the multi-hop router path instead.
+        Only the ETH route needs the zap: `ethIn` (and a sell with `payWith=eth`) answers
+        404 `ZAP_NOT_ENABLED` where no OpenZap is deployed (`contracts.zap` is null),
+        while `quoteIn` and `payWith=quote` encode plain OpenLaunch calls and answer
+        on every chain. A frozen quote asset is a 400 `QUOTE_FROZEN`, read live from the
+        launch rather than from the index.
+      parameters:
+        - { name: launch, in: query, required: true, schema: { type: string }, description: "launch address or its token address (`token` is accepted as an alias)" }
+        - { name: ethIn, in: query, schema: { type: string }, description: "buy, paying this much ETH (wei)" }
+        - { name: quoteIn, in: query, schema: { type: string }, description: "buy, paying this much of the quote asset (base units) – no pool leg" }
+        - { name: tokensIn, in: query, schema: { type: string }, description: "sell this many tokens (base units)" }
+        - { name: payWith, in: query, schema: { type: string, enum: [eth, quote] }, description: "on a sell: what the seller receives (default eth); on a buy it is implied by ethIn vs quoteIn" }
+        - { name: slippageBps, in: query, schema: { type: integer, default: 100, maximum: 5000 }, description: "per leg; the pool and curve haircuts compound" }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/ZapQuote" } } } }
+        "400": { description: "validation or state error (NOT_QUOTE_LAUNCH, ZAP_NOT_APPLICABLE, NO_POOL, QUOTE_FROZEN, CURVE_UNAVAILABLE with retriable false)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { description: "launch not indexed, or ZAP_NOT_ENABLED for the ETH route on this chain", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { description: rate limited }
   /tokens:
     get:
       tags: [public]
       summary: Token list (cursor pagination)
+      description: |
+        Crowd launches are excluded from every branch of this list except an explicit
+        crowd request – `mode=crowd`, or `status` one of raising/succeeded/failed/
+        written_off (and `status=dex` alongside `mode=crowd`, which then means "its pool
+        is seeded"). That is permanent, not a feature flag: `status=graduated` and
+        `status=dex` are public filters older than crowd, and a seeded raise satisfies
+        both, so including it would change what those filters mean without changing the
+        API version.
       parameters:
         - { name: cursor, in: query, schema: { type: string } }
         - { name: limit, in: query, schema: { type: integer, maximum: 100 } }
-        - { name: mode, in: query, schema: { type: string, enum: [fair, instant] } }
-        - { name: status, in: query, schema: { type: string, enum: [curve, graduated, dex] } }
+        - { name: mode, in: query, schema: { type: string, enum: [fair, instant, crowd] } }
+        - { name: status, in: query, schema: { type: string, enum: [curve, graduated, dex, raising, succeeded, failed, written_off] } }
         - { name: creator, in: query, schema: { type: string } }
         - { name: referrer, in: query, schema: { type: string } }
         - { name: symbol, in: query, schema: { type: string } }
-        - { name: sort, in: query, schema: { type: string, enum: [new, volume] } }
+        - name: sort
+          in: query
+          description: >-
+            `volume` ranks by 24h indexed volume converted to USD through each launch's own
+            price feed (a launch with no usable price is ranked last); the amounts in each
+            item stay in that launch's own unit.
+          schema: { type: string, enum: [new, volume] }
       responses: { "200": { description: OK } }
   /tokens/{address}:
     get:
       tags: [public]
       summary: Full token card (badges, trust score, curve state)
+      description: |
+        For a crowd launch: `trustScore` is null, `curve` is null, the fair-launch badges
+        are all explicitly false, and `crowd` carries the raise (plus its redemption floor
+        and checklist score). GET /crowd/{token} is the full campaign.
       parameters: [{ name: address, in: path, required: true, schema: { type: string } }]
-      responses: { "200": { description: OK }, "404": { description: not indexed } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Token" } } } }
+        "404": { description: not indexed }
+  # ORDER IS LOAD-BEARING in the implementation: /crowd/terms is registered before
+  # /crowd/{token}, or every terms request would be matched as a raise called "terms".
+  /crowd/terms:
+    get:
+      tags: [public]
+      summary: What creating a raise in one asset costs and is bound by (cached 60 s, failures included)
+      description: |
+        Omit `quote` for a raise denominated in the chain's native coin. A stale price feed
+        or an asset the registry does not allow-list answers 200 with `available: false`
+        and a reason – it is a state of the world, not a server fault, and creation would
+        revert in exactly the same place.
+      parameters:
+        - { name: quote, in: query, schema: { type: string }, description: "allow-listed ERC-20; omit for the native coin" }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/CrowdTerms" } } } }
+        "400": { description: "quote is not an address" }
+        "404": { description: "CROWD_NOT_ENABLED – no CrowdFactory on this chain" }
+  /crowd/attestations:
+    post:
+      tags: [public]
+      summary: Record that a wallet accepted the self-attestation statements
+      description: |
+        The interstitial shown before the first action on a raise (before the review step of
+        creating one, and before a launch is priced in a tokenised stock) is acknowledged
+        here, server-side: wallet address when one is connected, the identifier of the text
+        version shown, the surface, and the time. Nothing is blocked anywhere – the dialog
+        is the whole control (owner decision, 2026-09-10).
+        Nothing else is stored – no IP, no country, no user agent. A localStorage key alone
+        is a UX reminder that clearing site data erases; the point of the acknowledgement
+        is that it is provable.
+
+        `address` is OPTIONAL. On step 3 of /create the statements are read before a wallet
+        is connected, and refusing the record there would mean the one acknowledgement that
+        actually happened is the one never written down. A missing address is stored as
+        null and never invented; a present one must be a full 0x address.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version]
+              properties:
+                address: { type: string, nullable: true, description: "the wallet that accepted, when one is connected" }
+                version: { type: string, description: "identifier of the text shown, e.g. 2026-09-10" }
+                context: { type: string, enum: [page, create, pair], default: page, description: "page = a raise, create = the review step of a crowd create, pair = a launch paired with a stock token" }
+                token: { type: string, nullable: true, description: "the raise it was accepted for – a full address, or omitted on /create where no raise exists yet" }
+                quote: { type: string, nullable: true, description: "the paired asset a 'pair' attestation was made for – optional" }
+      responses:
+        "200": { description: recorded }
+        "400": { description: validation error }
+        "404": { description: "CROWD_NOT_ENABLED – the crowd surfaces only; context=pair is accepted with raises switched off" }
+  /crowd/attestations/{address}:
+    get:
+      tags: [public]
+      summary: Has this wallet accepted a given version of the statements?
+      parameters:
+        - { name: address, in: path, required: true, schema: { type: string } }
+        - { name: version, in: query, schema: { type: string } }
+      responses: { "200": { description: OK } }
+  /crowd/{token}:
+    get:
+      tags: [public]
+      summary: One crowd launch in full (cached 10 s)
+      description: |
+        Accepts the token address or the OpenCrowd address. Everything the campaign page
+        shows: the immutable terms, the clock (including the freeze extension), progress,
+        both supply figures, the settlement, the author's escrow with its solvency ratio
+        and the date the redemption floor reaches zero, and the five-point terms checklist.
+        No trust score – see the checklist. `metadata.matches` says whether the statements
+        served here are the bytes the creation transaction committed to.
+      parameters: [{ name: token, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/CrowdDetail" } } } }
+        "400": { description: invalid address }
+        "404": { description: no crowd launch indexed at this address }
+  /crowd/{token}/participant/{address}:
+    get:
+      tags: [public]
+      summary: One wallet's position in a raise, with a reason for every disabled action
+      description: |
+        Never cached. `blockedBy` is the machine-readable reason each of the six actions
+        cannot be taken right now, and `maxAcceptableWei` is what an amount field must
+        clamp to – it is zero for a creator-side address whose 10 % allowance is spent, so
+        the button can be disabled with `selfCap` instead of failing a gas estimate.
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+        - { name: address, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/CrowdParticipant" } } } }
+        "400": { description: invalid address }
+        "404": { description: no crowd launch indexed at this address }
+        "429": { description: rate limited }
+  /tokens/{address}/parked-payouts:
+    get:
+      tags: [public]
+      summary: Harvester payouts the launch's quote token refused (paused issuer or blocklisted recipient)
+      description: |
+        The harvester parks a payout instead of reverting; `claim(to)` on the harvester
+        releases it. `claimed` is a hint: PayoutClaimed does not name the rows it covered,
+        so the holding contract's own view stays authoritative.
+        A crowd launch parks payouts too, on the OpenCrowd contract itself, and those are
+        released by `claimParked(to)` – or, for the platform's own cut, by
+        `claimPlatformFee()` and nothing else. `source` on every row says which, and
+        `denomination` says what the amounts ARE: a raise that collects the native coin
+        parks NATIVE wei, which no harvester ever does.
+        `source` can be `null` on a row the RAISE holds: `platformTreasury()` was
+        unreadable when the log was indexed, so the two claim calls cannot be told apart
+        yet. Unknown is the honest answer – offer no claim button for such a row rather
+        than guessing `crowd`, which would revert `NothingToClaim` on the platform's pot.
+        The indexer reclassifies the row as soon as the address answers.
+      parameters: [{ name: address, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  harvester: { type: [string, "null"] }
+                  crowd: { type: [string, "null"], description: "the OpenCrowd holding a raise's parked payouts" }
+                  quote:
+                    oneOf:
+                      - type: "null"
+                      - $ref: "#/components/schemas/QuoteRef"
+                  denomination:
+                    type: object
+                    description: "what every amountWei below IS – native = the chain's coin"
+                    properties:
+                      symbol: { type: [string, "null"] }
+                      decimals: { type: integer }
+                      native: { type: boolean }
+                  pendingWei: { type: string, description: "sum of the un-claimed rows" }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        to: { type: string }
+                        amountWei: { type: string }
+                        ts: { type: [string, "null"], format: date-time }
+                        txHash: { type: [string, "null"] }
+                        claimed: { type: boolean }
+                        source: { type: string, enum: [harvester, crowd, crowd-fee], description: "which call releases it: claim(to) / claimParked(to) / claimPlatformFee()" }
+                        contract: { type: [string, "null"], description: "the contract that holds it" }
+                  note: { type: string }
+        "404": { description: not indexed }
   /launches:
     get: { tags: [public], summary: Alias of /tokens, responses: { "200": { description: OK } } }
   /launches/{address}/status:
@@ -171,9 +811,15 @@ paths:
               type: object
               required: [mode, token]
               properties:
-                mode: { type: string, enum: [fair, instant] }
+                mode: { type: string, enum: [fair, instant, crowd] }
                 creator: { type: string }
                 referrer: { type: string }
+                quote:
+                  type: string
+                  description: |
+                    Allow-listed ERC-20 to pair the launch with (GET /quotes). Omit for a
+                    native launch. In quote mode the fee, the target and the start FDV come
+                    from the registry, requiredValueWei is 0 and an approve() is required first.
                 platformShareBps: { type: integer, minimum: 1500, default: 5000 }
                 token:
                   type: object
@@ -196,9 +842,52 @@ paths:
                   properties:
                     poolPct: { type: number, minimum: 1, maximum: 100 }
                     seedEth: { type: number }
+                    seedQuote: { type: number, description: "seed liquidity in quote units (quote mode; alias of seedEth)" }
+                crowd:
+                  type: object
+                  description: |
+                    Required for mode=crowd. Every *Wei is base units of the asset the raise
+                    collects (`crowd.quote`, or the native coin when omitted). The supply is
+                    DERIVED by the factory from the price and the hard cap – there is nothing
+                    to pass for it, and the settlement then burns whatever went unplaced.
+                    There is no Supporter discount on a raise, and its creation fee is
+                    escrowed inside the raise and refunded if the raise fails.
+                    Each rule the factory enforces has its own error code here – BAD_PRICE,
+                    BAD_HARDCAP, BAD_POOL_BPS, BAD_SOFTCAP, BAD_DEADLINE, BAD_EXTENSION,
+                    BAD_EXTENSION_MIN_BPS, BAD_VESTING, BAD_INTERVAL, BAD_TEAM_VESTING,
+                    BAD_PARTICIPANT_VESTING, BAD_MIN_CONTRIBUTION, BAD_WALLET_CAP,
+                    BAD_CROWD_TOKENS_BPS, BAD_LISTING_PREMIUM, BAD_TEAM_TOKENS_BPS,
+                    BAD_TEAM_BENEFICIARY, BAD_FEE_TIER, BAD_ENTITLEMENT_FLOOR, BAD_POOL_SEED,
+                    BAD_SPLIT – because the contract answers all twenty with one BadConfig().
+                  required: [pricePerTokenWei, hardCapWei, softCapWei, poolBps, crowdTokensBps, vestingDurationSeconds]
+                  properties:
+                    quote: { type: string, description: "allow-listed ERC-20; omit for a native raise" }
+                    pricePerTokenWei: { type: string }
+                    hardCapWei: { type: string }
+                    softCapWei: { type: string, description: "at least 20 % of the hard cap" }
+                    minContributionWei: { type: string, description: "defaults to the asset's dust floor (GET /crowd/terms)" }
+                    perWalletCapWei: { type: string, description: "0 = no cap; otherwise between the minimum contribution and the hard cap" }
+                    poolBps: { type: integer, minimum: 3000, maximum: 10000 }
+                    crowdTokensBps: { type: integer, minimum: 1000, maximum: 9000, description: "sizes the derived supply; NOT the participants' share of what survives" }
+                    listingPremiumBps: { type: integer, maximum: 5000 }
+                    teamTokensBps: { type: integer, description: "x2 may not exceed crowdTokensBps; needs teamBeneficiary" }
+                    teamBeneficiary: { type: string }
+                    feeRecipient: { type: string, description: "defaults to the creator" }
+                    durationDays: { type: number, description: "length of the raise; DEADLINE_MARGIN (1800 s) of headroom is added automatically" }
+                    deadline: { type: integer, description: "absolute unix timestamp instead of durationDays" }
+                    extensionSeconds: { type: integer, maximum: 2592000 }
+                    extensionMinBps: { type: integer, minimum: 5000, maximum: 10000 }
+                    vestingDurationSeconds: { type: integer, description: "90-730 days" }
+                    vestingIntervalSeconds: { type: integer, description: "0 = continuous; otherwise >= 30 days and it must divide the duration exactly" }
+                    teamVestingDurationSeconds: { type: integer, description: "never shorter than the author's own" }
+                    participantVestingSeconds: { type: integer, maximum: 15552000 }
+                    poolFeeTier: { type: integer, enum: [100, 500, 3000, 10000] }
+                    allowlistRoot: { type: string }
+                    metadataHash: { type: string, description: "keccak256 of the metadata bytes – what the campaign page verifies against" }
       responses:
         "200": { description: quote, content: { application/json: { schema: { $ref: "#/components/schemas/Quote" } } } }
         "400": { description: validation error, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { description: "CROWD_NOT_ENABLED for mode=crowd on a chain without a CrowdFactory" }
         "429": { description: rate limited }
   /launches/simulate:
     post:
@@ -217,11 +906,28 @@ paths:
         "200": { description: simulation, content: { application/json: { schema: { $ref: "#/components/schemas/Simulation" } } } }
         "404": { description: unknown/expired quote }
   /referrers/{address}/summary:
-    get: { tags: [referrals], summary: Referral totals + claimable, parameters: [{ name: address, in: path, required: true, schema: { type: string } }], responses: { "200": { description: OK } } }
+    get:
+      tags: [referrals]
+      summary: Referral totals + claimable (per asset in claimableByUnit)
+      parameters: [{ name: address, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/ReferrerSummary" } } } }
   /referrers/{address}/tokens:
     get: { tags: [referrals], summary: Tokens launched through the referrer, parameters: [{ name: address, in: path, required: true, schema: { type: string } }], responses: { "200": { description: OK } } }
   /referrers/{address}/rewards:
-    get: { tags: [referrals], summary: Per-launch claimable (live on-chain reads), parameters: [{ name: address, in: path, required: true, schema: { type: string } }], responses: { "200": { description: OK } } }
+    get:
+      tags: [referrals]
+      summary: Per-launch claimable (live on-chain reads); each amount is in that launch's own asset
+      parameters: [{ name: address, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Reward" } }
   /referrers/{address}/payments:
     get: { tags: [referrals], summary: Payment history, parameters: [{ name: address, in: path, required: true, schema: { type: string } }], responses: { "501": { description: requires event indexing (not live yet) } } }
   /referrals/claims/prepare:
@@ -263,6 +969,10 @@ paths:
     post:
       tags: [sessions]
       summary: Extend the session TTL and report the current fee
+      description: |
+        `feeNowWei` is the native creation fee, and is null for a quote-paired session –
+        that fee is USD-anchored and charged in the quote asset, reported as
+        `feeNowQuoteWei` (base units of `quote.quote`).
       parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
       responses: { "200": { description: OK }, "409": { description: session closed } }
   /launch-sessions/{id}/complete:
@@ -271,11 +981,18 @@ paths:
       summary: Mark the session completed (called by the openfair UI after the user's wallet broadcast)
       parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
       requestBody: { content: { application/json: { schema: { type: object, required: [txHash], properties: { txHash: { type: string }, token: { type: string } } } } } }
-      responses: { "200": { description: OK }, "409": { description: one-time — already closed } }
+      responses: { "200": { description: OK }, "409": { description: one-time – already closed } }
   /events:
     get:
       tags: [events]
-      summary: "SSE stream (topics: launch.indexed, fair.graduated, trade.executed, session.completed; filters: topics, referrer)"
+      summary: "SSE stream (topics: launch.indexed, fair.graduated, trade.executed, session.completed, launch.frozen, crowd.contributed, crowd.settled, crowd.seeded, crowd.failed; filters: topics, referrer)"
+      description: |
+        The four crowd topics are the moments a raise moves somebody's money:
+        `crowd.contributed` (money in, `self: true` when it is the creator side's own),
+        `crowd.settled` (closed above the soft cap), `crowd.seeded` (the pool exists and
+        the token is transferable) and `crowd.failed` (refunds are open, `by` says whether
+        it was settle() or abandon()). A raise being created arrives as `launch.indexed`
+        with `mode: 'crowd'`, so an existing launch subscriber sees them without a change.
       parameters:
         - { name: topics, in: query, schema: { type: string, description: comma-separated } }
         - { name: referrer, in: query, schema: { type: string } }

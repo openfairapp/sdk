@@ -14,12 +14,18 @@
 </head>
 <body>
   <h1>Launch a token</h1>
-  <script src="https://sdk.openfair.app/openfair.js"></script>
+  <!-- Pinned build + SRI (every version's hash: https://sdk.openfair.app/sri.json).
+       https://sdk.openfair.app/openfair.js tracks the latest release without a hash. -->
+  <script src="https://sdk.openfair.app/v1.3.1/openfair.js"
+          integrity="sha384-9osMQyD17R1C7btT3WlqdJ/3SU2+cy8pM7ifHf+h9n/7P1LQaLiBwkVbPDZQGQZR" crossorigin="anonymous"></script>
+  <!-- Attributes: ref (your referral wallet), lang, mode="fair|instant" (locks the mode),
+       pair="0x…" (fixes the quote asset; omit it to let the user pick one where pairs exist). -->
   <openfair-create ref="0xYourReferralWallet" lang="en"></openfair-create>
   <script>
-    document.querySelector('openfair-create').addEventListener('of-created', (e) => {
-      console.log('token created:', e.detail); // { address, txHash, mode }
-    });
+    const el = document.querySelector('openfair-create');
+    el.addEventListener('of-pair-change', (e) => console.log('pair:', e.detail)); // { quote, symbol }
+    el.addEventListener('of-created', (e) => console.log('token created:', e.detail)); // { address, txHash, mode }
+    // Headless API from the same bundle: window.Openfair, Openfair.version, Openfair.chains (manifests)
   </script>
 </body>
 </html>

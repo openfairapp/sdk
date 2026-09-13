@@ -3,18 +3,18 @@
 // referral, LP lock); this library only makes calling them convenient:
 // quotes, simulation, a staged launch pipeline with progress events,
 // metadata pinning, curve math, token/referral registries and
-// human-readable errors. v1.1.0 – see docs/SDK_CHANGELOG.md.
+// human-readable errors. v1.3.1 – see docs/SDK_CHANGELOG.md.
 import {
   createPublicClient, createWalletClient, custom, http, fallback, defineChain,
-  parseEther, parseEventLogs, parseAbi, BaseError, ContractFunctionRevertedError,
+  parseEther, parseUnits, formatUnits, parseEventLogs, parseAbi, BaseError, ContractFunctionRevertedError,
   keccak256, concat, encodeAbiParameters, getCreate2Address,
   type Address, type WalletClient, type PublicClient,
 } from 'viem';
-import { CHAIN, ADDR, POOL_FEE_TIER, START_FDV_ETH, TARGET_ETH, SUPPORTER_SHARE_BPS } from '../src/lib/config';
+import { CHAIN, ADDR, POOL_FEE_TIER, SUPPORTER_SHARE_BPS } from '../src/lib/config';
 import { NETWORKS as REGISTRY } from '../src/content/networks.mjs';
-import { factoryAbi } from '../src/lib/abi';
+import { factoryAbi, factoryQuoteAbi, erc20Abi, zapAbi, quoterAbi } from '../src/lib/abi';
 
-export const SDK_VERSION = '1.2.0';
+export const SDK_VERSION = '1.3.1';
 
 const ZERO = '0x0000000000000000000000000000000000000000' as const;
 const ZERO_SALT = ('0x' + '0'.repeat(64)) as `0x${string}`;
@@ -22,9 +22,23 @@ const ZERO_SALT = ('0x' + '0'.repeat(64)) as `0x${string}`;
 const launchCreatedAbi = parseAbi([
   'event LaunchCreated(address indexed creator, address indexed token, address launch, address harvester, address teamVesting, address referrer, string metadataCID, (string,string,uint256,uint256,uint8,uint256,uint256,uint16,uint16,uint16,address,bool,uint64,uint256,uint256,uint256,uint24,uint256,address,uint64,uint256) params)',
 ]);
+// Quote-pairs factory events. Needed only in quote mode, and for two reasons:
+// the params tuple grew (different topic, so the ABI above cannot match it),
+// and a quote create pulls the asset with transferFrom BEFORE it deploys the
+// token – so receipt.logs[0] is the quote's Transfer, not the mint the native
+// path reads. `token` is indexed in both events.
+const quoteCreatedAbi = parseAbi([
+  'event LaunchCreated(address indexed creator, address indexed token, address launch, address harvester, address teamVesting, address referrer, string metadataCID, (string,string,uint256,uint256,uint8,uint256,uint256,uint16,uint16,uint16,address,bool,uint64,uint256,uint256,uint256,uint24,uint256,address,uint64,uint256,bytes32,uint256,address) params)',
+  'event DirectListingCreated(address indexed creator, address indexed token, address harvester, address pool, uint256 liquidityEth, uint256 poolTokens, string metadataCID, (string,string,uint256,uint16,address,uint24,uint256,bytes32,uint256,uint16,address,address,uint256) params)',
+]);
 const launchAbi = parseAbi([
   'function feesAccrued(address) view returns (uint256)',
   'function claimFees(address account)',
+  // Curve pricing + pair identity, for the coin-payment helpers (spec §10).
+  'function quoteBuy(uint256 ethAmount) view returns (uint256)',
+  'function quoteSell(uint256 tokensIn) view returns (uint256)',
+  'function quote() view returns (address)',
+  'function isNative() view returns (bool)',
 ]);
 
 // ---------------------------------------------------------------------------
@@ -37,8 +51,27 @@ export interface ChainManifest {
   rpcUrls: string[]; explorer: string;
   currency: { name: string; symbol: string; decimals: number };
   factoryVersion: string;
-  contracts: { factory: Address; simpleTokenDeployer: Address; fairTokenDeployer: Address; weth: Address };
+  /**
+   * `registry` is the chain's QuoteRegistry – the allow-list of ERC-20 assets a
+   * launch may be priced in instead of the native coin. `null` = this chain has
+   * no quote pairs and every launch on it is native. It also decides which
+   * factory shape applies: a manifest with a registry carries the factory that
+   * accepts the quote fields, so the two always travel together.
+   *
+   * `zap` is OpenZap – the contract that lets a buyer pay the chain's coin for
+   * a launch that collects an ERC-20 (spec §10). `null` = not deployed on this
+   * chain, and `buyWithEth` / `sellForEth` refuse instead of guessing an
+   * address; a paired launch is then traded in its own asset, as before.
+   */
+  contracts: { factory: Address; simpleTokenDeployer: Address; fairTokenDeployer: Address; weth: Address; registry: Address | null; zap: Address | null };
   dexSwapUrl: ((token: string) => string) | null;
+  /**
+   * Per-chain economics. The SDK can target ANY manifest, so these must come
+   * from the manifest and not from the chain this bundle happened to be built
+   * for – otherwise an Arc launch prepared through the SDK carried Robinhood's
+   * 5-unit curve target while the site used 10000.
+   */
+  economics: { deployFee: number; target: number; startFdv: number };
 }
 
 // Built from THE network registry (src/content/networks.mjs): EVERY network
@@ -55,8 +88,15 @@ export const CHAIN_MANIFESTS: Record<number, ChainManifest> = Object.fromEntries
       simpleTokenDeployer: n.contracts.simpleTokenDeployer as Address,
       fairTokenDeployer: n.contracts.fairTokenDeployer as Address,
       weth: n.contracts.weth as Address,
+      registry: (n.contracts.registry as Address | null) ?? null,
+      zap: (n.contracts.zap as Address | null) ?? null,
     },
     dexSwapUrl: (token: string) => `${n.dexSwapUrl}${token}`,
+    economics: {
+      deployFee: n.economics.deployFee,
+      target: n.economics.target,
+      startFdv: n.economics.startFdv,
+    },
   }]),
 );
 
@@ -74,8 +114,10 @@ export const chain = chainFromManifest(CHAIN_MANIFESTS[CHAIN.id]);
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
+// 'approving' only ever occurs on a quote-paired launch, where the factory
+// pulls an ERC-20 and therefore needs an allowance before the create itself.
 export type LaunchStage =
-  | 'validating' | 'preparing_metadata' | 'quoting' | 'simulating'
+  | 'validating' | 'preparing_metadata' | 'quoting' | 'approving' | 'simulating'
   | 'awaiting_wallet' | 'transaction_submitted' | 'confirming'
   | 'indexing' | 'completed' | 'failed';
 
@@ -113,6 +155,21 @@ function explainRevert(e: unknown, stage: LaunchStage = 'simulating'): OpenfairE
         BadConfig: ['invalid launch parameters', 'check supply/fees/curve inputs'],
         EthSendFailed: ['native transfer inside the contract failed', 'retry'],
         PoolSquatted: ['a mispriced pool already exists for this token/WETH pair', 'retry – a different token address avoids the squatted pool'],
+        QuoteNotAllowed: ['this asset is not on the registry allow-list', 'call quotes.list() for the assets a launch may be paired with'],
+        QuoteTransferMismatch: ['the quote asset moved a different amount than requested (transfer fee or issuer rule)', 'this asset cannot be used as a pair'],
+        QuoteFrozen: ['the issuer has paused the quote asset or blocked this launch', 'wait – trading resumes by itself once the issuer lifts it'],
+        QuoteNotAccepted: ['this launch is native: it takes the chain coin, not an ERC-20', 'drop `quote` / use buy()'],
+        NativeNotAccepted: ['this launch is paired with an ERC-20: it takes no native value', 'send the quote amount instead of msg.value'],
+        // OpenZap (spec §10) AND the native curve: OpenLaunch reverts this too
+        // when buy()/sell() miss their floor, so the wording must be true with
+        // no swap in the picture. On the ETH route it is usually the pool leg.
+        Slippage: ['the trade returned less than the floor the call was signed with – on the ETH route this is usually the pool leg', 'raise the slippage tolerance or re-quote'],
+        NothingReceived: ['a leg of the route delivered nothing', 're-quote – the pool may have no liquidity at this size'],
+        BadFee: ['the pool fee tier is not one of 500 / 3000 / 10000', 'take poolFee from zapQuote()'],
+        Expired: ['the deadline passed before the transaction was mined', 'retry with a fresh quote'],
+        NotQuoteLaunch: ['this launch collects the chain coin – it needs no zap', 'buy it directly'],
+        UnknownLaunch: ['the address is not a launch this factory created', 'pass a token from tokens.list()'],
+        TokenNotConsumed: ['the curve did not take the whole amount offered', 'lower the amount – the curve is close to its target'],
       };
       const [msg, action] = msgs[name] ?? [`contract reverted: ${name}`, 'check the parameters'];
       return new OpenfairError('SimulationFailed', msg, { stage, contractReason: name, suggestedAction: action, cause: e, retriable: name === 'WrongPayment' || name === 'EthSendFailed' });
@@ -172,6 +229,31 @@ export type Eip1193 = {
 
 export interface SocialLinks { website?: string; twitter?: string; telegram?: string; discord?: string }
 
+/**
+ * One allow-listed quote asset, as GET /api/v1/quotes reports it. Every *Wei
+ * field is in the asset's OWN base units and comes from the registry's USD
+ * anchor read at request time – so a launch paired with this asset costs
+ * `deployFeeWei` to create and graduates at `targetWei`, not at the chain's
+ * native figures. They are `null` exactly when the asset's price feed is stale
+ * or unreadable, which is also when a creation paired with it would revert.
+ */
+export interface QuoteAsset {
+  address: Address;
+  symbol: string | null;
+  /** v1 registry enforces 18; the field exists because the ABI carries it. */
+  decimals: number;
+  feed: Address | null;
+  enabled: boolean;
+  priceUsd: number | null;
+  /** Unix seconds of the feed's last answer; null when it could not be read. */
+  updatedAt: number | null;
+  /** Equity feeds run 24/5: stale means older than the registry's MAX_PRICE_AGE. */
+  stale: boolean;
+  deployFeeWei: bigint | null;
+  targetWei: bigint | null;
+  startFdvWei: bigint | null;
+}
+
 /** The three real on-chain anti-snipe knobs (presets are sugar over these). */
 export interface AntiSnipeCustom {
   /** Seconds for the global ramp to release the full sale (0 = off). */
@@ -184,6 +266,15 @@ export interface AntiSnipeCustom {
 export interface InstantParams extends SocialLinks {
   name: string;
   symbol: string;
+  /**
+   * Pair the launch with an allow-listed ERC-20 (address from `quotes.list()`)
+   * instead of the chain's native coin. Omitted / undefined = native, which is
+   * every launch this SDK made before 1.3.0 and stays byte-identical. In quote
+   * mode the transaction carries NO value: `seedEth`, `devBuyEth` and
+   * `vanityFeeWei` are amounts of the pair asset, the factory pulls them with
+   * transferFrom, and the fee/target/start FDV come from the registry.
+   */
+  quote?: string;
   /** Whole tokens, default 1_000_000_000. */
   totalSupply?: number;
   description?: string;
@@ -207,6 +298,8 @@ export interface InstantParams extends SocialLinks {
 export interface FairLaunchParams extends SocialLinks {
   name: string;
   symbol: string;
+  /** Pair with an allow-listed ERC-20 – see InstantParams.quote. */
+  quote?: string;
   totalSupply?: number;
   description?: string;
   logoDataUrl?: string | null;
@@ -238,11 +331,29 @@ export interface LaunchQuote {
   mode: 'instant' | 'fair';
   chainId: number;
   factory: Address;
+  /**
+   * The asset this launch is priced in – null = the chain's native coin.
+   * When it is set, every *Wei figure below except gasEstimateWei is in THAT
+   * asset's base units, and requiredValueWei is 0.
+   */
+  quote: QuoteAsset | null;
   deployFeeWei: bigint;
   supporterDiscountWei: bigint;
   gasEstimateWei: bigint;
   /** msg.value the transaction must carry (fee + seed/dev-buy + vanity). */
   requiredValueWei: bigint;
+  /** Quote mode: what the factory pulls with transferFrom (0 when native). */
+  requiredQuoteWei: bigint;
+  /**
+   * What `approve()` grants: requiredQuoteWei plus 1%, because the factory
+   * re-reads the price feed when the create lands and a downward tick of the
+   * asset inside that window raises what it pulls.
+   */
+  approveAmountWei: bigint;
+  /** Current allowance to the factory; null when no wallet is connected. */
+  allowanceWei: bigint | null;
+  /** true = call `launch.approve(quote)` before executing (quote mode only). */
+  approvalNeeded: boolean;
   /** requiredValueWei + gasEstimateWei. */
   estimatedTotalWei: bigint;
   platformShareBps: number;
@@ -286,6 +397,11 @@ export type CreateResult = Pick<LaunchResult, 'token' | 'txHash' | 'openfairUrl'
 
 export interface ProgressEvent { stage: LaunchStage; progress: number; correlationId: string; txHash?: `0x${string}` }
 
+/**
+ * Curve economics. The `*Eth` names are v1.0 and kept for compatibility: every
+ * amount is denominated in the launch's OWN unit, which is `unit` – the chain
+ * coin for a native launch, the pair's symbol for a quote-paired one.
+ */
 export interface FairPreview {
   saleSupply: number;
   priceMultiple: number;
@@ -295,6 +411,10 @@ export interface FairPreview {
   graduationFdvEth: number;
   targetEth: number;
   buyExamples: { eth: number; tokens: number; pctOfSale: number; priceImpactPct: number }[];
+  /** Ticker every figure above is quoted in. */
+  unit: string;
+  /** The pair asset, or null when the launch is native. */
+  quote: Address | null;
 }
 
 export interface TokenListItem {
@@ -308,6 +428,42 @@ export interface LaunchStatus {
   progress: number;
   ethCollected?: string;
   targetEth?: string;
+}
+
+/**
+ * A priced ETH route into (or out of) a launch that collects an ERC-20
+ * (spec §10). Two legs, each with its own floor: the pool leg is where MEV
+ * lives, the curve leg moves with whatever the pool actually delivered.
+ * `poolFee` is DISCOVERED per asset – the deepest of the three tiers OpenZap
+ * accepts – never configured, because liquidity moves between them.
+ */
+export interface ZapQuote {
+  token: Address;
+  launch: Address;
+  /** The ERC-20 the curve collects – the middle of the route. */
+  quote: Address;
+  /** 500 / 3000 / 10000: the only tiers the zap will route through. */
+  poolFee: number;
+  /** Coin in (buy) or launch tokens in (sell). */
+  amountIn: bigint;
+  quoteOut: bigint;
+  /** Curve tokens for a buy, coin for a sell. */
+  amountOut: bigint;
+  minQuoteOut: bigint;
+  /** Floor for the leg that CONSUMES the pool leg's output, so its haircut
+   *  compounds with minQuoteOut's – flooring both at (1-s) reverts Slippage on
+   *  a route that behaved inside tolerance. Same rule as the API's minimums. */
+  minAmountOut: bigint;
+  /** 'chain' = priced here because the backend has no zap-quote route yet. */
+  source: 'api' | 'chain';
+  /** true when the input takes everything the curve has left: OpenLaunch caps
+   *  the fill and refunds the overpayment in the QUOTE asset, never as ETH
+   *  through the zap. `suggestedAmountIn` is the input that fills it exactly.
+   *  Only the API can see this – it is undefined on a chain-priced quote. */
+  fillsCurve?: boolean;
+  suggestedAmountIn?: bigint | null;
+  /** ISO time the older leg was read on-chain (API-priced quotes only). */
+  quotedAt?: string;
 }
 
 export interface ReferralPosition {
@@ -339,6 +495,7 @@ export class Openfair {
   readonly tokens: TokensApi;
   readonly referrals: ReferralsApi;
   readonly contracts: ContractsApi;
+  readonly quotes: QuotesApi;
 
   constructor(opts: OpenfairOptions = {}) {
     const m = CHAIN_MANIFESTS[opts.chainId ?? CHAIN.id];
@@ -360,6 +517,7 @@ export class Openfair {
     this.tokens = new TokensApi(this);
     this.referrals = new ReferralsApi(this);
     this.contracts = new ContractsApi(this);
+    this.quotes = new QuotesApi(this);
   }
 
   // ---- events ----
@@ -441,6 +599,18 @@ export class Openfair {
     const fee = await read('deployFee');
     const bps = await read('supporterFeeBps').catch(() => 5000); // pre-v1.9 factories: fixed half price
     return { deployFeeWei: fee as bigint, supporterFeeWei: (fee as bigint) * BigInt(Number(bps)) / 10000n };
+  }
+
+  /**
+   * Supporter multiplier on the creation fee, in bps of the list fee (5000 =
+   * half price, 0 = free). A quote-paired launch pays the registry's fee in the
+   * pair asset, and the factory applies THIS same rule to it – so the discount
+   * has to be read on its own rather than inferred from the native fee pair.
+   */
+  async supporterFeeBps(): Promise<number> {
+    return await this.public.readContract({
+      address: this.manifest.contracts.factory, abi: factoryAbi, functionName: 'supporterFeeBps',
+    }).then((v) => Number(v)).catch(() => 5000); // pre-v1.9 factories: fixed half price
   }
 
   /** Downscale a logo File exactly like openfair.app does (≤512px). */
@@ -541,6 +711,7 @@ export class Openfair {
       sdkVersion: SDK_VERSION,
       chainId: this.manifest.chainId,
       factoryVersion: this.manifest.factoryVersion,
+      quoteRegistry: this.manifest.contracts.registry,
       rpcOk, factoryOk,
       walletConnected: !!this.account,
       lastOperation: this.lastOp ? {
@@ -590,7 +761,13 @@ export class LaunchOperation {
         throw new OpenfairError('TransactionReverted', 'the transaction reverted on-chain', { stage: 'confirming', transactionHash: this.txHash, suggestedAction: 'inspect the tx on the explorer' });
       }
       let tokenAddress: Address | null;
-      if (quote.mode === 'fair') {
+      if (quote.quote) {
+        // Quote mode: both events carry the token, and logs[0] is the pair
+        // asset's Transfer, so neither native shortcut applies.
+        const name = quote.mode === 'fair' ? 'LaunchCreated' : 'DirectListingCreated';
+        const events = parseEventLogs({ abi: quoteCreatedAbi, eventName: name, logs: receipt.logs });
+        tokenAddress = (events[0]?.args.token as Address) ?? null;
+      } else if (quote.mode === 'fair') {
         const events = parseEventLogs({ abi: launchCreatedAbi, logs: receipt.logs });
         tokenAddress = (events[0]?.args.token as Address) ?? null;
       } else {
@@ -639,41 +816,72 @@ class LaunchApi {
     const sdk = this.sdk;
     if (!config.name || !config.symbol) throw new OpenfairError('BadInput', 'name and symbol are required', { stage: 'validating' });
     const shareBps = config.platformShareBps ?? 5000;
-    const { deployFeeWei, supporterFeeWei } = await sdk.fees();
-    const fee = shareBps >= SUPPORTER_SHARE_BPS ? supporterFeeWei : deployFeeWei;
+    const qa = config.quote ? await sdk.quotes.require(config.quote) : null;
+    const qdec = qa?.decimals ?? 18;
+    // Money units of this launch. Native: the chain's coin and the factory's own
+    // deployFee. Quote: the pair asset, whose fee/target/start FDV the registry
+    // derives from the USD anchor – the factory reads the SAME views when the
+    // create lands, so quoting from anywhere else would drift from the payment.
+    const nativeFees = qa ? null : await sdk.fees();
+    const listFee = qa ? qa.deployFeeWei! : nativeFees!.deployFeeWei;
+    const supporterFee = qa
+      ? qa.deployFeeWei! * BigInt(await sdk.supporterFeeBps()) / 10000n
+      : nativeFees!.supporterFeeWei;
+    const fee = shareBps >= SUPPORTER_SHARE_BPS ? supporterFee : listFee;
+    const econ = qa
+      ? {
+          deployFee: Number(formatUnits(listFee, qdec)),
+          target: Number(formatUnits(qa.targetWei!, qdec)),
+          startFdv: Number(formatUnits(qa.startFdvWei!, qdec)),
+        }
+      : sdk.manifest.economics;
+    // Amounts the caller states in whole units (seedEth / devBuyEth) are the
+    // PAIR asset in quote mode – nothing here is ever ETH-denominated then.
+    const amount = (whole: number) => parseUnits(String(whole), qdec);
     const vanityFee = config.vanityFeeWei ?? 0n;
     let params: Record<string, unknown>;
     let value: bigint;
+    let quoteDue: bigint;
     if (config.mode === 'instant') {
       const totalSupply = config.totalSupply ?? 1_000_000_000;
       const seedEth = config.seedEth ?? 0;
+      const seedWei = amount(seedEth);
       params = {
         name: config.name, symbol: config.symbol,
         totalSupply: parseEther(String(totalSupply)),
         poolBps: Math.round((config.poolPct ?? 100) * 100),
         feeRecipient: (config.feeRecipient ?? ZERO) as Address,
         poolFeeTier: POOL_FEE_TIER,
-        startPriceWei: seedEth > 0 ? 0n : BigInt(Math.round(START_FDV_ETH * 1e18 / totalSupply)),
+        // Start price = start FDV / supply, in the launch's unit. Quote mode
+        // divides the registry's exact figure instead of a float round-trip.
+        startPriceWei: seedEth > 0 ? 0n
+          : qa ? qa.startFdvWei! / BigInt(totalSupply)
+          : BigInt(Math.round(sdk.manifest.economics.startFdv * 1e18 / totalSupply)),
         salt: config.salt ?? ZERO_SALT,
         vanityFeeWei: vanityFee,
         platformShareBps: shareBps,
         referrer: sdk.txReferrer(),
+        ...(qa ? { quote: qa.address, liquidityQuote: seedWei } : {}),
       };
-      value = fee + parseEther(String(seedEth)) + vanityFee;
+      value = qa ? 0n : fee + seedWei + vanityFee;
+      quoteDue = qa ? fee + seedWei + vanityFee : 0n;
     } else {
       const totalSupply = config.totalSupply ?? 1_000_000_000;
       const curveType = config.curveType ?? 0;
-      const { multiple, saleSupply } = deriveCurve(curveType, totalSupply);
+      const { multiple, saleSupply } = deriveCurve(curveType, totalSupply, econ);
       const anti = antiSnipeNumbers(config.antiSnipe ?? 'normal', saleSupply, totalSupply);
       const teamPct = Math.min(config.teamPct ?? 0, 20);
-      const devBuy = config.devBuyEth ?? 0;
+      const devBuyWei = amount(config.devBuyEth ?? 0);
       params = {
         name: config.name, symbol: config.symbol,
         totalSupply: parseEther(String(totalSupply)),
         saleSupply: parseEther(String(saleSupply)),
         curveType,
         priceMultiple: BigInt(multiple),
-        targetEth: parseEther(String(TARGET_ETH)),
+        // Quote mode REQUIRES 0 here (spec §11c): the factory takes the target
+        // from the registry and rejects a caller-supplied one rather than
+        // silently ignoring it.
+        targetEth: qa ? 0n : parseEther(String(sdk.manifest.economics.target)),
         buyFeeBps: Math.round((config.buyFeePct ?? 1) * 100),
         sellFeeBps: Math.round((config.sellFeePct ?? 1) * 100),
         platformShareBps: shareBps,
@@ -687,17 +895,31 @@ class LaunchApi {
         teamAllocation: parseEther(String(Math.floor((config.totalSupply ?? 1_000_000_000) * teamPct / 100))),
         teamBeneficiary: (config.teamBeneficiary ?? sdk.account ?? ZERO) as Address,
         teamVestingDuration: BigInt(teamPct > 0 ? (config.teamMonths ?? 6) * 30 * 86400 : 0),
-        devBuyEth: parseEther(String(devBuy)),
+        devBuyEth: devBuyWei,
         salt: config.salt ?? ZERO_SALT,
         vanityFeeWei: vanityFee,
+        ...(qa ? { quote: qa.address } : {}),
       };
-      value = fee + parseEther(String(devBuy)) + vanityFee;
+      value = qa ? 0n : fee + devBuyWei + vanityFee;
+      quoteDue = qa ? fee + devBuyWei + vanityFee : 0n;
+    }
+    // Allowance to the factory, read only when there is a wallet to read it
+    // for: without it the caller cannot know whether execute() needs a first
+    // signature. approve() grants 1% over the requirement (feed re-read).
+    const approveAmount = quoteDue === 0n ? 0n : quoteDue + quoteDue / 100n;
+    let allowanceWei: bigint | null = null;
+    if (qa && sdk.account) {
+      allowanceWei = await sdk.public.readContract({
+        address: qa.address, abi: erc20Abi, functionName: 'allowance',
+        args: [sdk.account, sdk.manifest.contracts.factory],
+      }).catch(() => null) as bigint | null;
     }
     // Gas estimate: same calldata shape with a placeholder CID (CIDs are
-    // fixed-length, so the estimate matches the real tx within noise).
+    // fixed-length, so the estimate matches the real tx within noise). In quote
+    // mode it reverts until the allowance lands, which is not an error here.
     let gasWei = 0n;
     try {
-      const gas = await sdk.public.estimateContractGas(this.callFor({ params, value, mode: config.mode }, 'bafkreicfxudbe2wjpnyecchmyaa2ufnpiss4ht24uvxgamqit67r7ybc3a') as unknown as Parameters<PublicClient['estimateContractGas']>[0]);
+      const gas = await sdk.public.estimateContractGas(this.callFor({ params, value, mode: config.mode, quote: qa }, 'bafkreicfxudbe2wjpnyecchmyaa2ufnpiss4ht24uvxgamqit67r7ybc3a') as unknown as Parameters<PublicClient['estimateContractGas']>[0]);
       const gasPrice = await sdk.public.getGasPrice();
       gasWei = gas * gasPrice * 12n / 10n; // +20% headroom
     } catch { /* без кошелька или при реверте оценка недоступна – квота всё равно полезна */ }
@@ -705,10 +927,15 @@ class LaunchApi {
       mode: config.mode,
       chainId: sdk.manifest.chainId,
       factory: sdk.manifest.contracts.factory,
-      deployFeeWei,
-      supporterDiscountWei: deployFeeWei - supporterFeeWei,
+      quote: qa,
+      deployFeeWei: listFee,
+      supporterDiscountWei: listFee - supporterFee,
       gasEstimateWei: gasWei,
       requiredValueWei: value,
+      requiredQuoteWei: quoteDue,
+      approveAmountWei: approveAmount,
+      allowanceWei,
+      approvalNeeded: !!qa && (allowanceWei === null || allowanceWei < quoteDue),
       estimatedTotalWei: value + gasWei,
       platformShareBps: shareBps,
       referralShareBps: sdk.txReferrer() === ZERO ? 0 : 5000,
@@ -718,20 +945,54 @@ class LaunchApi {
     };
   }
 
-  private callFor(q: { params: Record<string, unknown>; value: bigint; mode: 'instant' | 'fair' }, cid: string):
-    { chain: typeof chain; account?: Address; address: Address; abi: typeof factoryAbi; functionName: 'createDirectListing' | 'createLaunch'; args: readonly unknown[]; value: bigint } {
+  private callFor(q: { params: Record<string, unknown>; value: bigint; mode: 'instant' | 'fair'; quote: QuoteAsset | null }, cid: string):
+    { chain: typeof chain; account?: Address; address: Address; abi: typeof factoryAbi | typeof factoryQuoteAbi; functionName: 'createDirectListing' | 'createLaunch'; args: readonly unknown[]; value: bigint } {
     const sdk = this.sdk;
+    // The two ABIs differ only in the quote fields appended LAST to each
+    // struct, so a native launch keeps encoding byte-for-byte as before.
+    const abi = q.quote ? factoryQuoteAbi : factoryAbi;
     return q.mode === 'instant'
       ? {
           chain: sdk.chain, account: sdk.account ?? undefined,
-          address: sdk.manifest.contracts.factory, abi: factoryAbi,
+          address: sdk.manifest.contracts.factory, abi,
           functionName: 'createDirectListing' as const, args: [q.params as never, cid] as const, value: q.value,
         }
       : {
           chain: sdk.chain, account: sdk.account ?? undefined,
-          address: sdk.manifest.contracts.factory, abi: factoryAbi,
+          address: sdk.manifest.contracts.factory, abi,
           functionName: 'createLaunch' as const, args: [q.params as never, sdk.txReferrer(), cid] as const, value: q.value,
         };
+  }
+
+  /**
+   * Grant the factory the allowance a quote-paired launch needs. No-op (returns
+   * null) for a native launch or when the standing allowance already covers it.
+   * execute() calls this itself; it is public so an integrator can stage the
+   * two signatures in their own UI.
+   */
+  async approve(quote: LaunchQuote): Promise<`0x${string}` | null> {
+    const sdk = this.sdk;
+    const qa = quote.quote;
+    if (!qa || quote.requiredQuoteWei === 0n) return null;
+    if (!sdk.account) await sdk.connect();
+    const allowance = await sdk.public.readContract({
+      address: qa.address, abi: erc20Abi, functionName: 'allowance',
+      args: [sdk.account!, sdk.manifest.contracts.factory],
+    }).catch(() => 0n) as bigint;
+    if (allowance >= quote.requiredQuoteWei) {
+      quote.allowanceWei = allowance;
+      quote.approvalNeeded = false;
+      return null;
+    }
+    const hash = await sdk.walletClient().writeContract({
+      chain: sdk.chain, account: sdk.account!,
+      address: qa.address, abi: erc20Abi, functionName: 'approve',
+      args: [sdk.manifest.contracts.factory, quote.approveAmountWei],
+    });
+    await sdk.public.waitForTransactionReceipt({ hash });
+    quote.allowanceWei = quote.approveAmountWei;
+    quote.approvalNeeded = false;
+    return hash;
   }
 
   /** Dry-run the exact transaction (balance + eth_call) BEFORE the wallet opens. */
@@ -741,16 +1002,48 @@ class LaunchApi {
     try {
       const bal = await sdk.public.getBalance({ address: sdk.account });
       const headroom = quote.gasEstimateWei > 0n ? quote.gasEstimateWei : parseEther('0.001');
+      // Native launch: one balance covers value + gas. Quote launch: msg.value
+      // is 0, so the native balance is a GAS check only and the payment is
+      // judged against the pair asset – a shortfall names the asset that is
+      // actually short instead of the coin the user has plenty of.
       if (bal < quote.requiredValueWei + headroom) {
         return {
           success: false,
           error: new OpenfairError('InsufficientFunds',
-            `wallet needs ~${fmtNative(quote.requiredValueWei + headroom)} ${sdk.manifest.currency.symbol} (value + gas), has ${fmtNative(bal)}`,
+            `wallet needs ~${fmtNative(quote.requiredValueWei + headroom)} ${sdk.manifest.currency.symbol} (${quote.quote ? 'gas' : 'value + gas'}), has ${fmtNative(bal)}`,
             { stage: 'simulating', suggestedAction: 'top up the wallet' }),
         };
       }
+      if (quote.quote) {
+        const unit = quote.quote.symbol ?? 'the quote asset';
+        const qbal = await sdk.public.readContract({
+          address: quote.quote.address, abi: erc20Abi, functionName: 'balanceOf', args: [sdk.account],
+        }).catch(() => 0n) as bigint;
+        if (qbal < quote.requiredQuoteWei) {
+          return {
+            success: false,
+            error: new OpenfairError('InsufficientQuoteBalance',
+              `wallet needs ${formatUnits(quote.requiredQuoteWei, quote.quote.decimals)} ${unit} (fee + seed/dev-buy + vanity), has ${formatUnits(qbal, quote.quote.decimals)}`,
+              { stage: 'simulating', suggestedAction: `acquire ${unit} before launching` }),
+          };
+        }
+        // eth_call would only report the factory's transferFrom failing, which
+        // reads as a contract bug rather than a missing first signature.
+        const allowance = await sdk.public.readContract({
+          address: quote.quote.address, abi: erc20Abi, functionName: 'allowance',
+          args: [sdk.account, sdk.manifest.contracts.factory],
+        }).catch(() => 0n) as bigint;
+        if (allowance < quote.requiredQuoteWei) {
+          return {
+            success: false,
+            error: new OpenfairError('ApprovalRequired',
+              `the factory must be allowed to pull ${formatUnits(quote.requiredQuoteWei, quote.quote.decimals)} ${unit}`,
+              { stage: 'simulating', retriable: true, suggestedAction: 'call launch.approve(quote) first (execute() does it for you)' }),
+          };
+        }
+      }
       // The CID string length never changes the revert outcome – placeholder is fine here.
-      const call = this.callFor({ params: quote.params, value: quote.requiredValueWei, mode: quote.mode }, 'bafkreicfxudbe2wjpnyecchmyaa2ufnpiss4ht24uvxgamqit67r7ybc3a');
+      const call = this.callFor({ params: quote.params, value: quote.requiredValueWei, mode: quote.mode, quote: quote.quote }, 'bafkreicfxudbe2wjpnyecchmyaa2ufnpiss4ht24uvxgamqit67r7ybc3a');
       const gas = await sdk.public.estimateContractGas(call as unknown as Parameters<PublicClient['estimateContractGas']>[0]);
       return { success: true, gasEstimate: gas };
     } catch (e) {
@@ -758,11 +1051,27 @@ class LaunchApi {
     }
   }
 
-  /** Fair-launch economics before any transaction: prices, FDV, buy examples. */
-  preview(config: { curveType?: 0 | 1 | 2; totalSupply?: number }): FairPreview {
+  /**
+   * Fair-launch economics before any transaction: prices, FDV, buy examples.
+   * Pass `quote` (an entry from `quotes.list()`) to get the same numbers in
+   * THAT asset's units – the curve of a paired launch is anchored to the
+   * registry's target, not to the chain's.
+   */
+  preview(config: { curveType?: 0 | 1 | 2; totalSupply?: number; quote?: QuoteAsset | null }): FairPreview {
     const curveType = config.curveType ?? 0;
     const totalSupply = config.totalSupply ?? 1_000_000_000;
-    const { multiple: M, saleSupply: S } = deriveCurve(curveType, totalSupply);
+    const qa = config.quote ?? null;
+    if (qa && (qa.targetWei === null || qa.startFdvWei === null)) {
+      throw new OpenfairError('QuotePriceStale', `no live price for ${qa.symbol ?? qa.address} – its economics cannot be derived`, { stage: 'validating', retriable: true });
+    }
+    const econ = qa
+      ? {
+          deployFee: Number(formatUnits(qa.deployFeeWei ?? 0n, qa.decimals)),
+          target: Number(formatUnits(qa.targetWei!, qa.decimals)),
+          startFdv: Number(formatUnits(qa.startFdvWei!, qa.decimals)),
+        }
+      : this.sdk.manifest.economics;
+    const { multiple: M, saleSupply: S } = deriveCurve(curveType, totalSupply, econ);
     // Relative price shape p(s), s = sold fraction 0..1, p(0)=1, p(1)=M.
     const rel = (s: number): number => {
       if (curveType === 1) return 1 + (M - 1) * s;
@@ -770,11 +1079,11 @@ class LaunchApi {
       const r = Math.sqrt(M) / (Math.sqrt(M) - 1);
       return 1 / Math.pow(1 - s / r, 2);
     };
-    // Scale p0 so that ∫ p(s)·S ds over 0..1 equals TARGET_ETH.
+    // Scale p0 so that ∫ p(s)·S ds over 0..1 equals the chain's target.
     const n = 2000;
     let integ = 0;
     for (let i = 0; i < n; i++) integ += rel((i + 0.5) / n) / n;
-    const p0 = TARGET_ETH / (S * integ);
+    const p0 = econ.target / (S * integ);
     const buyExamples = [0.1, 0.5, 1].map((eth) => {
       let spent = 0, s = 0;
       const ds = 1 / n;
@@ -786,8 +1095,15 @@ class LaunchApi {
       saleSupply: S, priceMultiple: M,
       startPriceEth: p0, finalPriceEth: p0 * M,
       startFdvEth: p0 * totalSupply, graduationFdvEth: p0 * M * totalSupply,
-      targetEth: TARGET_ETH, buyExamples,
+      targetEth: econ.target, buyExamples,
+      unit: qa ? (qa.symbol ?? short(qa.address)) : this.sdk.manifest.currency.symbol,
+      quote: qa ? qa.address : null,
     };
+  }
+
+  /** preview() for a pair given by address – resolves the asset, then previews. */
+  async previewFor(quote: string | null, config: { curveType?: 0 | 1 | 2; totalSupply?: number } = {}): Promise<FairPreview> {
+    return this.preview({ ...config, quote: quote ? await this.sdk.quotes.require(quote) : null });
   }
 
   /** Pin metadata + send the transaction. Returns an operation to wait() on. */
@@ -816,13 +1132,22 @@ class LaunchApi {
       const cid = await sdk.metadataCid({ ...metadata, extraMetadata: c.extraMetadata }, opts.signal);
       throwIfAborted(opts.signal, 'preparing_metadata');
 
+      // A quote-paired launch needs the allowance BEFORE the dry-run: without
+      // it the factory's transferFrom reverts and the simulation would only
+      // report that. Native launches never reach this branch.
+      if (quote.quote && quote.requiredQuoteWei > 0n) {
+        emit('approving', 0.25);
+        await this.approve(quote);
+        throwIfAborted(opts.signal, 'approving');
+      }
+
       emit('simulating', 0.3);
       const sim = await this.simulate(quote);
       if (!sim.success) throw sim.error;
       throwIfAborted(opts.signal, 'simulating');
 
       emit('awaiting_wallet', 0.45);
-      const call = this.callFor({ params: quote.params, value: quote.requiredValueWei, mode: quote.mode }, cid);
+      const call = this.callFor({ params: quote.params, value: quote.requiredValueWei, mode: quote.mode, quote: quote.quote }, cid);
       const txHash = await sdk.walletClient().writeContract(call as unknown as Parameters<WalletClient['writeContract']>[0]);
       emit('transaction_submitted', 0.6, txHash);
       return new LaunchOperation(sdk, quote, txHash, correlationId, metadata);
@@ -856,6 +1181,26 @@ class LaunchApi {
       [config.name, config.symbol, parseEther(String(totalSupply)), holder],
     );
     return getCreate2Address({ from: deployer, salt, bytecodeHash: keccak256(concat([bytecode, args])) });
+  }
+
+  // ---- coin payment for a launch this API just created (spec §10) ----------
+  // The implementation lives on `tokens` (it is about an existing launch, not
+  // about creating one); these forward to it so an integrator who holds
+  // `sdk.launch` after a create does not have to reach for another surface.
+
+  /** @see TokensApi.zapQuote */
+  zapQuote(token: string, opts?: { ethIn?: bigint; tokensIn?: bigint; slippageBps?: number }): Promise<ZapQuote> {
+    return this.sdk.tokens.zapQuote(token, opts);
+  }
+
+  /** @see TokensApi.buyWithEth */
+  buyWithEth(token: string, opts: { ethIn: bigint; slippageBps?: number; deadlineSec?: number; quote?: ZapQuote }): Promise<`0x${string}`> {
+    return this.sdk.tokens.buyWithEth(token, opts);
+  }
+
+  /** @see TokensApi.sellForEth */
+  sellForEth(token: string, opts: { tokensIn: bigint; slippageBps?: number; deadlineSec?: number; quote?: ZapQuote }): Promise<`0x${string}`> {
+    return this.sdk.tokens.sellForEth(token, opts);
   }
 }
 
@@ -931,6 +1276,187 @@ class TokensApi {
     if (raw.readyToGraduate) return { phase: 'readyToGraduate', progress: 1 };
     if (raw.startTime > Date.now() / 1000) return { phase: 'upcoming', progress: 0 };
     return { phase: 'curve', progress: raw.state?.progress ?? 0, ethCollected: raw.state?.ethCollected, targetEth: raw.targetEth };
+  }
+
+  // ---- pay a quote-paired launch in the chain's coin (OpenZap, spec §10) ----
+
+  /**
+   * The launch + pair behind a token, refusing every state in which the zap
+   * cannot be used – so the caller gets a reason instead of a revert.
+   */
+  private async curvePair(token: string): Promise<{ launch: Address; quote: Address; zap: Address }> {
+    const zap = this.sdk.manifest.contracts.zap;
+    if (!zap) {
+      throw new OpenfairError('ZapUnavailable', `chain ${this.sdk.manifest.chainId} has no OpenZap deployment – trade this launch in its own asset`, { stage: 'validating' });
+    }
+    const t = await this.get(token);
+    if (!t) throw new OpenfairError('TokenNotFound', `${token} is not an openfair launch`, { stage: 'validating' });
+    const raw = t.raw as { launch?: string; kind?: string; graduated?: boolean; quote?: { address?: string } | null };
+    if (raw.kind === 'direct' || raw.graduated) {
+      throw new OpenfairError('NotOnCurve', 'this token trades in a Uniswap pool, not on a curve – swap WETH -> quote -> token on the router instead', { stage: 'validating' });
+    }
+    if (!raw.quote?.address) {
+      throw new OpenfairError('NotQuoteLaunch', 'this launch collects the chain coin already – buy it directly, no zap needed', { stage: 'validating' });
+    }
+    return { launch: raw.launch as Address, quote: raw.quote.address as Address, zap };
+  }
+
+  /**
+   * Best of the three tiers for one hop, or null when none of them prices.
+   *
+   * QuoterV2 is NOT in the chain manifest (the manifests carry the openfair
+   * deployment, not Uniswap's periphery), so this on-chain path only exists for
+   * the chain THIS bundle was built for. Targeting another chain's zap through
+   * `new Openfair({ chainId })` leaves the API as the only pricing source –
+   * which is the normal case anyway, and a missing route is reported as
+   * NoRoute rather than guessed.
+   */
+  private async bestHop(tokenIn: Address, tokenOut: Address, amountIn: bigint): Promise<{ poolFee: number; amountOut: bigint } | null> {
+    if (this.sdk.manifest.chainId !== CHAIN.id) return null;
+    const quoter = ADDR.quoterV2 as Address;
+    const legs = await Promise.all([500, 3000, 10000].map(async (poolFee) => {
+      try {
+        const r = await this.sdk.public.readContract({
+          address: quoter, abi: quoterAbi, functionName: 'quoteExactInputSingle',
+          args: [{ tokenIn, tokenOut, amountIn, fee: poolFee, sqrtPriceLimitX96: 0n }],
+        }) as readonly [bigint, bigint, number, bigint];
+        return { poolFee, amountOut: r[0] };
+      } catch { return null; }
+    }));
+    let best: { poolFee: number; amountOut: bigint } | null = null;
+    for (const l of legs) if (l && l.amountOut > 0n && (best === null || l.amountOut > best.amountOut)) best = l;
+    return best;
+  }
+
+  /**
+   * Price an ETH buy (`ethIn`) or an ETH-settled sell (`tokensIn`) end to end.
+   * The openfair API answers the buy side from a 10 s cache; both sides fall
+   * back to QuoterV2 + the curve's own views, so an integrator pointed at a
+   * backend that predates the route still gets numbers.
+   *
+   * `slippageBps` sizes BOTH floors (default 2 %). Never send a zero floor: the
+   * contract accepts it on purpose (aggregators need "any price") and it makes
+   * the trade a free sandwich.
+   */
+  async zapQuote(token: string, opts: { ethIn?: bigint; tokensIn?: bigint; slippageBps?: number } = {}): Promise<ZapQuote> {
+    const { launch, quote } = await this.curvePair(token);
+    const bps = BigInt(10000 - (opts.slippageBps ?? 200));
+    /** The second leg spends what the first delivered, and the first may fill
+     *  at exactly its own floor – so the haircuts compound. One haircut on both
+     *  legs is a revert on a route that stayed inside tolerance. */
+    const floor2 = (x: bigint) => (x * bps * bps) / 100000000n;
+    const weth = this.sdk.manifest.contracts.weth;
+    if (opts.tokensIn !== undefined) {
+      if (opts.tokensIn <= 0n) throw new OpenfairError('BadConfig', 'tokensIn must be > 0', { stage: 'validating' });
+      const quoteOut = await this.sdk.public.readContract({
+        address: launch, abi: launchAbi, functionName: 'quoteSell', args: [opts.tokensIn],
+      }).catch(() => 0n) as bigint;
+      const leg = quoteOut > 0n ? await this.bestHop(quote, weth, quoteOut) : null;
+      if (!leg) throw new OpenfairError('NoRoute', 'no WETH pool for the pair asset could be priced', { stage: 'quoting', retriable: true });
+      return {
+        token: token as Address, launch, quote, poolFee: leg.poolFee,
+        amountIn: opts.tokensIn, quoteOut, amountOut: leg.amountOut,
+        // Curve leg once, pool leg twice: the pool is quoted from the FULL
+        // curve payout while the curve may legally pay only (1-s) of it.
+        minQuoteOut: quoteOut * bps / 10000n, minAmountOut: floor2(leg.amountOut),
+        source: 'chain',
+      };
+    }
+    const ethIn = opts.ethIn ?? 0n;
+    if (ethIn <= 0n) throw new OpenfairError('BadConfig', 'pass ethIn (buy) or tokensIn (sell)', { stage: 'validating' });
+    // The wire names are the *Wei ones (ZapQuote in docs/openapi.yaml). Reading
+    // `quoteOut`/`tokensOut` here made every API answer look empty and sent
+    // every caller down the chain path – including the cross-chain manifests
+    // bestHop() cannot serve at all.
+    const fromApi = await fetch(`${this.sdk.apiBase}/api/v1/zap-quote?launch=${launch}&ethIn=${ethIn.toString()}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((b) => (b?.data ?? null) as {
+        poolFee?: number | string; quoteOutWei?: string; tokensOutWei?: string | null;
+        fillsCurve?: boolean; suggestedEthInWei?: string | null; quotedAt?: string;
+      } | null)
+      .catch(() => null);
+    if (fromApi?.quoteOutWei && fromApi.tokensOutWei) {
+      const quoteOut = BigInt(fromApi.quoteOutWei);
+      const tokensOut = BigInt(fromApi.tokensOutWei);
+      if (quoteOut > 0n && tokensOut > 0n) {
+        return {
+          token: token as Address, launch, quote, poolFee: Number(fromApi.poolFee),
+          amountIn: ethIn, quoteOut, amountOut: tokensOut,
+          minQuoteOut: quoteOut * bps / 10000n, minAmountOut: floor2(tokensOut),
+          source: 'api',
+          fillsCurve: fromApi.fillsCurve ?? false,
+          suggestedAmountIn: fromApi.suggestedEthInWei ? BigInt(fromApi.suggestedEthInWei) : null,
+          quotedAt: fromApi.quotedAt,
+        };
+      }
+    }
+    const leg = await this.bestHop(weth, quote, ethIn);
+    if (!leg) throw new OpenfairError('NoRoute', 'no WETH pool for the pair asset could be priced', { stage: 'quoting', retriable: true });
+    const tokensOut = await this.sdk.public.readContract({
+      address: launch, abi: launchAbi, functionName: 'quoteBuy', args: [leg.amountOut],
+    }).catch(() => 0n) as bigint;
+    if (tokensOut === 0n) throw new OpenfairError('NoRoute', 'the curve returned nothing for that amount', { stage: 'quoting', retriable: true });
+    return {
+      token: token as Address, launch, quote, poolFee: leg.poolFee,
+      amountIn: ethIn, quoteOut: leg.amountOut, amountOut: tokensOut,
+      // Pool leg once, curve leg twice – it is priced from the full pool output.
+      minQuoteOut: leg.amountOut * bps / 10000n, minAmountOut: floor2(tokensOut),
+      source: 'chain',
+    };
+  }
+
+  /**
+   * Buy a quote-paired launch with the chain's coin in ONE signature: the zap
+   * wraps, swaps and buys on the curve, and the tokens are credited to the
+   * caller (the curve books the buy against them, so the anti-snipe cap and the
+   * ramp apply to the buyer, not to the zap). No allowance is involved – the
+   * payment is msg.value.
+   */
+  async buyWithEth(token: string, opts: { ethIn: bigint; slippageBps?: number; deadlineSec?: number; quote?: ZapQuote } = { ethIn: 0n }): Promise<`0x${string}`> {
+    const sdk = this.sdk;
+    const q = opts.quote ?? await this.zapQuote(token, { ethIn: opts.ethIn, slippageBps: opts.slippageBps });
+    if (!sdk.account) await sdk.connect();
+    try {
+      const hash = await sdk.walletClient().writeContract({
+        chain: sdk.chain, account: sdk.account!,
+        address: sdk.manifest.contracts.zap!, abi: zapAbi, functionName: 'buyWithEth',
+        args: [q.launch, q.poolFee, q.minQuoteOut, q.minAmountOut, deadline(opts.deadlineSec)],
+        value: q.amountIn,
+      });
+      await sdk.public.waitForTransactionReceipt({ hash });
+      return hash;
+    } catch (e) { throw explainRevert(e, 'awaiting_wallet'); }
+  }
+
+  /**
+   * Sell curve tokens for the chain's coin. Two signatures: the zap moves the
+   * tokens with transferFrom, so it needs an allowance first (exact amount –
+   * this is a per-trade allowance, not a standing one).
+   */
+  async sellForEth(token: string, opts: { tokensIn: bigint; slippageBps?: number; deadlineSec?: number; quote?: ZapQuote } = { tokensIn: 0n }): Promise<`0x${string}`> {
+    const sdk = this.sdk;
+    const q = opts.quote ?? await this.zapQuote(token, { tokensIn: opts.tokensIn, slippageBps: opts.slippageBps });
+    if (!sdk.account) await sdk.connect();
+    const zap = sdk.manifest.contracts.zap!;
+    try {
+      const allowance = await sdk.public.readContract({
+        address: q.token, abi: erc20Abi, functionName: 'allowance', args: [sdk.account!, zap],
+      }).catch(() => 0n) as bigint;
+      if (allowance < q.amountIn) {
+        const approval = await sdk.walletClient().writeContract({
+          chain: sdk.chain, account: sdk.account!,
+          address: q.token, abi: erc20Abi, functionName: 'approve', args: [zap, q.amountIn],
+        });
+        await sdk.public.waitForTransactionReceipt({ hash: approval });
+      }
+      const hash = await sdk.walletClient().writeContract({
+        chain: sdk.chain, account: sdk.account!,
+        address: zap, abi: zapAbi, functionName: 'sellForEth',
+        args: [q.launch, q.amountIn, q.minQuoteOut, q.poolFee, q.minAmountOut, deadline(opts.deadlineSec)],
+      });
+      await sdk.public.waitForTransactionReceipt({ hash });
+      return hash;
+    } catch (e) { throw explainRevert(e, 'awaiting_wallet'); }
   }
 }
 
@@ -1037,8 +1563,91 @@ class ContractsApi {
 }
 
 // ---------------------------------------------------------------------------
+// Quote pairs: the allow-list of assets a launch can be priced in
+// ---------------------------------------------------------------------------
+interface RawQuote {
+  address: string; symbol: string | null; decimals: number | null; feed: string | null;
+  enabled: boolean; priceUsd: number | null; updatedAtUnix: number | null; stale: boolean;
+  deployFeeWei: string | null; targetWei: string | null; startFdvWei: string | null;
+}
+
+class QuotesApi {
+  // 60 s, matching the backend's own cache: the figures move with a Chainlink
+  // feed, and a create page that renders a list re-asks on every keystroke.
+  private cache: { at: number; items: QuoteAsset[] } | null = null;
+  constructor(private sdk: Openfair) {}
+
+  /** Does this chain have a QuoteRegistry at all? */
+  get supported(): boolean { return this.sdk.manifest.contracts.registry !== null; }
+  /** The chain's QuoteRegistry, or null where quote pairs are off. */
+  get registry(): Address | null { return this.sdk.manifest.contracts.registry; }
+
+  /**
+   * Allow-listed assets, newest figures from the openfair API. Empty on a chain
+   * without a registry and on a backend that predates quote pairs – so a caller
+   * that always shows the list simply shows nothing there.
+   */
+  async list(opts: { force?: boolean } = {}): Promise<QuoteAsset[]> {
+    if (!this.supported) return [];
+    if (!opts.force && this.cache && Date.now() - this.cache.at < 60_000) return this.cache.items;
+    const res = await fetch(`${this.sdk.apiBase}/api/v1/quotes`).catch(() => null);
+    if (!res || !res.ok) {
+      if (this.cache) return this.cache.items;
+      if (res && res.status === 404) return [];
+      throw new OpenfairError('NetworkUnavailable', 'the quote list could not be read', { retriable: true });
+    }
+    const body = await res.json() as { data?: { items?: RawQuote[] } };
+    const items = (body.data?.items ?? []).map((r): QuoteAsset => ({
+      address: r.address as Address,
+      symbol: r.symbol,
+      decimals: r.decimals ?? 18, // v1 registry enforces 18
+      feed: (r.feed as Address | null) ?? null,
+      enabled: !!r.enabled,
+      priceUsd: r.priceUsd ?? null,
+      updatedAt: r.updatedAtUnix ?? null,
+      stale: !!r.stale,
+      deployFeeWei: r.deployFeeWei === null ? null : BigInt(r.deployFeeWei),
+      targetWei: r.targetWei === null ? null : BigInt(r.targetWei),
+      startFdvWei: r.startFdvWei === null ? null : BigInt(r.startFdvWei),
+    }));
+    this.cache = { at: Date.now(), items };
+    return items;
+  }
+
+  /** One asset by address (case-insensitive), or null if it is not listed. */
+  async get(address: string): Promise<QuoteAsset | null> {
+    const want = address.toLowerCase();
+    return (await this.list()).find((q) => q.address.toLowerCase() === want) ?? null;
+  }
+
+  /**
+   * @internal get() for the launch pipeline: turns every reason a pair cannot
+   * be used into the error the caller can act on, instead of a revert later.
+   */
+  async require(address: string): Promise<QuoteAsset> {
+    if (!this.supported) {
+      throw new OpenfairError('QuotePairsUnavailable', `chain ${this.sdk.manifest.chainId} has no quote registry – omit \`quote\` to launch in ${this.sdk.manifest.currency.symbol}`, { stage: 'validating' });
+    }
+    const qa = await this.get(address);
+    if (!qa || !qa.enabled) {
+      throw new OpenfairError('QuoteNotAllowed', `${address} is not an allow-listed quote asset`, { stage: 'validating', suggestedAction: 'call quotes.list() for the assets a launch may be paired with' });
+    }
+    if (qa.deployFeeWei === null || qa.targetWei === null || qa.startFdvWei === null) {
+      throw new OpenfairError('QuotePriceStale', `the price feed for ${qa.symbol ?? address} is stale or unreadable – creation would revert`, { stage: 'validating', retriable: true, suggestedAction: 'try again when the feed publishes (equity feeds trade 24/5)' });
+    }
+    return qa;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+function short(a: string): string { return `${a.slice(0, 6)}…${a.slice(-4)}`; }
+
+/** Wall-clock bound OpenZap enforces itself – SwapRouter02 moved the deadline
+ *  out of its params struct into multicall, which the zap does not use. */
+function deadline(seconds = 600): bigint { return BigInt(Math.floor(Date.now() / 1000) + seconds); }
+
 function throwIfAborted(signal: AbortSignal | undefined, stage: LaunchStage) {
   if (signal?.aborted) throw new OpenfairError('Aborted', 'the operation was aborted', { stage, retriable: true });
 }
@@ -1049,7 +1658,9 @@ function fmtNative(wei: bigint): string {
 
 /** Price-multiple + sale-supply derivation, mirrored from openfair.app:
  * every launch starts at the fixed START_FDV, so M is fully determined. */
-function deriveCurve(curveType: 0 | 1 | 2, totalSupply: number): { multiple: number; saleSupply: number } {
+function deriveCurve(curveType: 0 | 1 | 2, totalSupply: number, econ: ChainManifest['economics']): { multiple: number; saleSupply: number } {
+  const TARGET_ETH = econ.target;
+  const START_FDV_ETH = econ.startFdv;
   const T = totalSupply;
   let best = 2, bestErr = Infinity;
   const per = (M: number) => curveType === 0

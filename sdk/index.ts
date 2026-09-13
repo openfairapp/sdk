@@ -1,6 +1,6 @@
 // openfair SDK bundle entry: window.Openfair (headless) + <openfair-create>.
 // Served from https://openfair.app/sdk/openfair.js (latest) and
-// /sdk/v<semver>/openfair.js (pinned) — deliberately unlisted; shared
+// /sdk/v<semver>/openfair.js (pinned) – deliberately unlisted; shared
 // privately with integration partners.
 import { Openfair, OpenfairError, SDK_VERSION, CHAIN_MANIFESTS } from './core';
 import { OpenfairCreateElement } from './element';
