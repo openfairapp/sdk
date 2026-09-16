@@ -5,6 +5,8 @@
 // of-progress, of-tx-submitted, of-indexed, of-error, of-created.
 // i18n: built-in en/ru; any string is overridable via the `dict` attribute
 // (JSON) or the `.dictionary` property.
+// Chain: `chain-id` picks the deployment to launch on; absent = the chain this
+// bundle was built for (see connectedCallback for why that default bites).
 import { Openfair, type LaunchResult, type ProgressEvent, type QuoteAsset } from './core';
 
 type Lang = 'en' | 'ru';
@@ -136,7 +138,7 @@ export class OpenfairCreateElement extends HTMLElementBase {
   /** Custom translation overrides (also settable via the `dict` attribute as JSON). */
   dictionary: Partial<Record<string, string>> | null = null;
 
-  static get observedAttributes() { return ['ref', 'lang', 'mode', 'pair', 'api-base', 'dict']; }
+  static get observedAttributes() { return ['ref', 'lang', 'mode', 'pair', 'api-base', 'chain-id', 'dict']; }
 
   private fire(name: string, detail?: unknown) {
     this.dispatchEvent(new CustomEvent(name, { bubbles: true, composed: true, detail }));
@@ -144,7 +146,33 @@ export class OpenfairCreateElement extends HTMLElementBase {
 
   connectedCallback() {
     const apiBase = this.getAttribute('api-base') ?? 'https://openfair.app';
-    this.sdk = new Openfair({ referrer: this.getAttribute('ref') ?? undefined, apiBase });
+    // `chain-id` names the deployment this widget launches on. Absent = the
+    // chain the BUNDLE was built for, which is every integration written before
+    // this attribute existed and stays exactly as it was.
+    //
+    // That default is why the attribute is here: one pinned file is served from
+    // every openfair domain, and it was compiled for Robinhood Chain – so the
+    // snippet an Arc reader copied off arc.openfair.app built a widget that
+    // created tokens on 4663, silently and successfully.
+    //
+    // A present-but-unknown id is NOT quietly ignored. Falling back to the
+    // bundle's own chain is precisely the bug above, so the SDK's BadConfig –
+    // which lists the ids it knows – is rendered in place of the form instead.
+    const chainAttr = this.getAttribute('chain-id');
+    try {
+      this.sdk = new Openfair({
+        referrer: this.getAttribute('ref') ?? undefined,
+        apiBase,
+        ...(chainAttr === null ? {} : { chainId: Number(chainAttr) }),
+      });
+    } catch (e) {
+      const message = (e as Error).message;
+      this.attachShadow({ mode: 'open' });
+      this.shadowRoot!.innerHTML = `<style>${STYLE}</style>
+        <div role="status" aria-live="polite"><div class="err" part="error">${esc(message)}</div></div>`;
+      this.fire('of-error', { code: 'BadConfig', stage: 'validating', retriable: false, message });
+      return;
+    }
     const m = this.getAttribute('mode');
     if (m === 'fair' || m === 'instant') this.mode = m;
     this.pair = this.getAttribute('pair') ?? '';

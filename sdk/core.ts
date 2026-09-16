@@ -3,18 +3,22 @@
 // referral, LP lock); this library only makes calling them convenient:
 // quotes, simulation, a staged launch pipeline with progress events,
 // metadata pinning, curve math, token/referral registries and
-// human-readable errors. v1.3.1 – see docs/SDK_CHANGELOG.md.
+// human-readable errors. v1.3.2 – see docs/SDK_CHANGELOG.md.
 import {
   createPublicClient, createWalletClient, custom, http, fallback, defineChain,
   parseEther, parseUnits, formatUnits, parseEventLogs, parseAbi, BaseError, ContractFunctionRevertedError,
-  keccak256, concat, encodeAbiParameters, getCreate2Address,
   type Address, type WalletClient, type PublicClient,
 } from 'viem';
 import { CHAIN, ADDR, POOL_FEE_TIER, SUPPORTER_SHARE_BPS } from '../src/lib/config';
 import { NETWORKS as REGISTRY } from '../src/content/networks.mjs';
 import { factoryAbi, factoryQuoteAbi, erc20Abi, zapAbi, quoterAbi } from '../src/lib/abi';
+// The CREATE2 rules the site mines by – ONE module, so the SDK and the wizard
+// can never disagree about what a salt produces.
+import {
+  planVanityMine, predictTokenAddress, servedShapeMismatch, type ServedCreationCode,
+} from '../src/lib/vanity';
 
-export const SDK_VERSION = '1.3.1';
+export const SDK_VERSION = '1.3.3';
 
 const ZERO = '0x0000000000000000000000000000000000000000' as const;
 const ZERO_SALT = ('0x' + '0'.repeat(64)) as `0x${string}`;
@@ -1165,22 +1169,66 @@ class LaunchApi {
     return op.wait({ confirmations: opts.confirmations, waitForIndexer: opts.waitForIndexer, signal: opts.signal });
   }
 
-  /** Predict the CREATE2 token address for a salt (verify mined vanity salts). */
+  /**
+   * Predict the CREATE2 token address for a salt (verify mined vanity salts).
+   *
+   * The initcode is the token's creation code FOLLOWED BY its encoded
+   * constructor arguments, so this is right only when both halves belong to the
+   * same contract. It used to hand-roll a FOUR-argument tail, which is wrong in
+   * two directions at once: §12b appended a fifth `router` argument on the v3
+   * (quote-pairs) generation, and the chains running the STABLE lineage compile
+   * a different OpenFairToken altogether. Both halves now come from the same
+   * place they do on the site – `planVanityMine` for the shape (driven by the
+   * manifest's own factoryVersion, so the SDK can target any chain), the
+   * backend for the bytes – and the two are checked against each other before a
+   * single hash is taken, using the constructor the served bytes were compiled
+   * with.
+   */
   async predictAddress(config: LaunchConfig, salt: `0x${string}`): Promise<Address> {
     const sdk = this.sdk;
     const mode = config.mode;
     const contractName = mode === 'fair' ? 'OpenFairToken' : 'OpenSimpleToken';
+    const m = sdk.manifest;
+    // The manifest IS the config here: `new Openfair({ chainId })` may target a
+    // chain this bundle was not built for, so nothing may come from the
+    // build-time table – hence no `fallback` that could answer instead.
+    const plan = planVanityMine({
+      kind: mode === 'fair' ? 'curve' : 'direct',
+      factory: m.contracts.factory,
+      quoteSelected: Boolean(config.quote),
+      cfg: {
+        contracts: {
+          launchFactory: m.contracts.factory,
+          factoryVersion: m.factoryVersion,
+          fairTokenDeployer: m.contracts.fairTokenDeployer,
+          simpleTokenDeployer: m.contracts.simpleTokenDeployer,
+          zap: m.contracts.zap,
+        },
+        features: { quotePairs: m.contracts.registry !== null },
+      },
+      fallback: { fairTokenDeployer: m.contracts.fairTokenDeployer, simpleTokenDeployer: m.contracts.simpleTokenDeployer },
+      token: { name: config.name, symbol: config.symbol, totalSupply: parseEther(String(config.totalSupply ?? 1_000_000_000)) },
+    });
+    if (!plan.ok) {
+      throw new OpenfairError('BadConfig', `cannot determine the ${contractName} constructor for this chain – no address can be predicted`);
+    }
     const res = await fetch(`${sdk.apiBase}/api/bytecode/${contractName}`);
     if (!res.ok) throw new OpenfairError('NetworkUnavailable', 'could not fetch token bytecode');
-    const { bytecode } = await res.json() as { bytecode: `0x${string}` };
-    const totalSupply = config.totalSupply ?? 1_000_000_000;
-    const holder = mode === 'fair' ? sdk.manifest.contracts.fairTokenDeployer : sdk.manifest.contracts.factory;
-    const deployer = mode === 'fair' ? sdk.manifest.contracts.fairTokenDeployer : sdk.manifest.contracts.simpleTokenDeployer;
-    const args = encodeAbiParameters(
-      [{ type: 'string' }, { type: 'string' }, { type: 'uint256' }, { type: 'address' }],
-      [config.name, config.symbol, parseEther(String(totalSupply)), holder],
-    );
-    return getCreate2Address({ from: deployer, salt, bytecodeHash: keccak256(concat([bytecode, args])) });
+    const served = await res.json() as ServedCreationCode;
+    if (!/^0x[0-9a-fA-F]{2,}$/.test(served?.bytecode ?? '')) {
+      throw new OpenfairError('NetworkUnavailable', 'the backend served no token creation code');
+    }
+    if (servedShapeMismatch(plan.ctor, served)) {
+      throw new OpenfairError(
+        'BadConfig',
+        `the ${contractName} this backend serves (${served.source ?? 'unknown source'}) takes `
+        + `(${served.ctorTypes?.join(', ')}), not the constructor this chain's factory calls – `
+        + 'the predicted address would be one nothing deploys',
+      );
+    }
+    return predictTokenAddress({
+      creationCode: served.bytecode as `0x${string}`, ctor: plan.ctor, deployer: plan.deployer, salt,
+    });
   }
 
   // ---- coin payment for a launch this API just created (spec §10) ----------

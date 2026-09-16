@@ -1,5 +1,82 @@
 # Changelog
 
+## 1.3.3 – 2026-09-16
+
+`launch.predictAddress()` predicted an address nothing on the chain deploys.
+
+A CREATE2 address is `keccak(0xff ++ deployer ++ salt ++ keccak(initCode))`, and
+the initCode is the token's creation code followed by its **encoded constructor
+arguments**. This package hard-coded a four-argument tail. That is wrong twice
+over: the v3 factory generation on Robinhood (4663) appends a fifth argument
+(`router`), and the `contracts/src/stable/` lineage behind Stable (988) and Arc
+(5042) is a different contract under the same name. A salt mined towards such a
+prediction buys an address the factory can never mint – the vanity fee is paid
+up front.
+
+### Changed
+- **`launch.predictAddress(config, salt)`** now computes CREATE2 through
+  `src/lib/vanity.ts` – the same module the openfair.app wizard mines with – so
+  the SDK and the site cannot disagree about what a salt produces. The
+  constructor shape comes from `manifest.factoryVersion`, never from a literal;
+  the package's own second encoder is gone.
+- **`GET /api/bytecode/:name`** now answers `{ bytecode, ctorTypes, source,
+  lineage }`. The SDK checks the served `ctorTypes` against the shape it worked
+  out and throws `BadConfig` – naming the source path and the shape it got –
+  instead of returning an address. A backend older than 1.3.3 answers `bytecode`
+  alone: silence is the old contract, not a mismatch.
+- **Refusals, never guesses**: an unknown factory generation is `BadConfig`; a
+  host whose `contracts/out` does not hold this chain's lineage answers 503 and
+  the SDK raises `NetworkUnavailable`. No address is returned in either case.
+
+### Unchanged
+- Every method of 1.0–1.3.2, the create path, the widget, the zap, the chain
+  manifests and their addresses.
+- `<openfair-create chain-id="…">` – added in **1.3.2**, unchanged here.
+
+## 1.3.2 – 2026-09-16
+
+Arc mainnet (chain **5042**) carries its launch contracts. Nothing existing
+changes shape: the chain table every manifest is built from moved, and the
+widget element gained one optional attribute. The reason this needed a version
+of its own is that a pin is immutable – v1.2.1 through v1.3.1 were cut before
+the cutover and still describe the retired Arc testnet (5042002), which nothing
+can fix in place without breaking the `integrity` attribute already pasted into
+other people's HTML.
+
+### Added
+- **`<openfair-create chain-id="…">`** – names the deployment the widget
+  launches on, so one pinned bundle serves every domain; absent = the chain the
+  bundle was built for (unchanged for every existing integration), and an id the
+  bundle does not know renders `BadConfig` instead of silently launching on the
+  built-in chain.
+
+### Changed
+- **Arc manifest**: `chainId` 5042, RPC `https://rpc.mainnet.arc.io`, and the
+  five launch addresses broadcast on 2026-09-16 – LaunchFactory
+  `0xb122C3C07f7fFC0c72bE2AC1933a6D188ef09912`, SimpleTokenDeployer
+  `0x6A4b2f1e771349Cfe2E4ea507e0651E8B3F2f35f`, FairTokenDeployer
+  `0x7bf697F9Eb52605fD1DCE1Cc9cbf94E289C85f06`, OpenPromotions
+  `0xB35963EDD6059E1Df875202aA3Aea7d185E5c5a9`, OpenSubdomains
+  `0xFf8b0b4901ccaC881E7C5733ff8A321eA144C31B`. The chain table carries all
+  five; `manifest.contracts` exposes the first three of them, as it always has.
+  They are not `null` in 1.3.1: that pin, and every pin before it, carries the
+  retired 5042002 testnet's own addresses under the `arc` key (factory
+  `0x514488E3dD7E78848Db8dD22cfd8c27077f102d5`, SimpleTokenDeployer
+  `0x6E53cf0adb1A9640E1dCB7DD6ABF3d766Bcd02B6`, FairTokenDeployer
+  `0x5db37e8860d8C2B187031b5BCddf80d07b0eb5a8`) and has no `promotions` /
+  `subdomains` slots at all – both are new to the table here. So a client still
+  pinned to 1.3.1 is not pointed at nothing, it is pointed at three addresses
+  with no code on 5042, which is the whole reason this cutover needed a version
+  of its own instead of an edit.
+- The pool quote on Arc is the 6-decimal USDC ERC-20 face
+  `0x3600000000000000000000000000000000000000`, not a wrapped native coin, and
+  the deployment runs the Stable lineage (`factoryVersion` 2.1): the 23-field
+  pre-v3 create, no QuoteRegistry (`registry: null`) and no zap (`zap: null`).
+
+### Unchanged
+- Every method of 1.0–1.3.1, the Robinhood and Stable manifests, the widget,
+  and the wire format of every call.
+
 ## 1.3.1 – 2026-09-07
 
 ETH access to launches that collect an ERC-20 (spec §10), through the new

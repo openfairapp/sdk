@@ -4,5 +4,16 @@
   // `strict`: that is what esbuild sees where the published @openfair/sdk build is
   // made, and it is what keeps the bundles byte-identical to it – class fields with
   // define semantics, no "use strict" directive in the CJS / IIFE outputs.
+  //
+  // The second half of that byte-identity lives in package.json: `npm run build`
+  // passes --ignore-annotations. The published build is made in a workspace whose
+  // package.json carries no `sideEffects` field; ours carries one (the widget's
+  // two entry points), and a `sideEffects` ARRAY declares every file outside it
+  // side-effect-free – so esbuild here would tree-shake the unused constants out
+  // of src/lib/crowdMath.ts and produce a smaller, different bundle than the one
+  // on npm. --ignore-annotations makes esbuild ignore that field (and /* @__PURE__ */
+  // comments) for the bundle only; the field stays in the published package.json,
+  // where it is a promise to the CONSUMER's bundler and must not change.
+  // Not passed to build:browser – that bundle is not a published artefact.
   "compilerOptions": {}
 }

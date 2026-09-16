@@ -3,6 +3,11 @@
     "target": "ES2020",
     "module": "ESNext",
     "moduleResolution": "bundler",
+    // sdk/core.ts predicts addresses through src/lib/vanity.ts – the same module
+    // the openfair.app wizard mines with – and that file's own imports carry an
+    // explicit .ts extension so `node --test` can load it directly. Legal here
+    // because this project only emits declarations.
+    "allowImportingTsExtensions": true,
     "lib": ["ES2021", "DOM", "DOM.Iterable"],
     "strict": true,
     "skipLibCheck": true,

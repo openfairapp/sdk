@@ -17,6 +17,17 @@ const TARGET_CHAIN =
 export const IS_STABLE = TARGET_CHAIN === 'stable';
 export const IS_ARC = TARGET_CHAIN === 'arc';
 
+/**
+ * A slot in an ADDR table whose contract is built but not yet broadcast.
+ *
+ * It is the zero address on purpose. The table is typed as strings and read by
+ * calldata encoders, by the CREATE2 vanity miner and by every explorer link,
+ * so a null would move a build-time fact ("nothing is deployed yet") into a
+ * runtime TypeError in whichever component happened to touch it first. The
+ * zero address is inert, unmistakable in a wallet prompt, and greppable.
+ */
+const PENDING = '0x0000000000000000000000000000000000000000';
+
 // On Stable the native gas token USDT0 is 18-decimal at the EVM level
 // (msg.value / parseEther work unchanged) but reads as USDT0. There is no
 // wrapped native: `weth` below is the USDT0 ERC-20 (6d) used as the pool quote.
@@ -33,8 +44,9 @@ const ROBINHOOD = {
     // 0x35a0c465…5fAd4E) keeps serving the tokens it minted and stays indexed,
     // but every NEW launch is created here.
     factory: '0x1Af66EB4e249EfB0eDD975A10A8bD6c98789CFce',
-    promotions: '0x1aF3Cc534ad6F78eEaBCFfe295FA0210CdFf6b31', // v2.1: supporter via harvester share
-    subdomains: '0x78Bcf75c837D3d80959AAb169272EF25aBcC5107',
+    // promotions / subdomains are NOT here any more: they come from the
+    // registry's `contracts` block, like everything else the site spends
+    // against. See the ADDR export below.
     weth: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',
     simpleTokenDeployer: '0x69B229843fD08E76D55373901CB57dE571987c36', // unchanged by v3
     fairTokenDeployer: '0x28ae99370203fC25c605Cebb5Cd411Da479d772A', // v3: §12b token ctor
@@ -52,8 +64,7 @@ const STABLE = {
   },
   ADDR: {
     factory: '0xd4a5AC9D63954C33b9E0dd045da5fb9e41A1B8f2', // v2: audit fixes
-    promotions: '0xdd8715fa10C91ad22e15620023F4A70aDafF245E',
-    subdomains: '0x1D16C3600136eD44A3D4FA259aC614Ba4E975123',
+    // promotions / subdomains: registry-derived (see the ADDR export below).
     // USDT0 ERC-20 (6d) – the pool quote asset; there is no WETH on Stable.
     weth: '0x779Ded0c9e1022225f8E0630b35a9b54bE713736',
     simpleTokenDeployer: '0x8b5dCdeF943b16f2a07f56E7ffE38bBad7A9d2bd',
@@ -63,29 +74,59 @@ const STABLE = {
   },
 } as const;
 
-// Arc (Circle's testnet, chain 5042002). Native gas is USDC with 18-decimal
-// EVM semantics, so – unlike Stable – no decimal adaptation is needed and the
-// shared contracts run unchanged. It is a TESTNET: no bridge from Ethereum, no
-// DEX aggregator coverage, funds come from a faucet.
+// Arc mainnet, chain 5042 (Circle's L1, public mainnet since 2026-09-16 – the
+// 5042002 testnet is retired and none of its addresses have code here). Native
+// gas is USDC with 18-decimal wei semantics, and its ERC-20 face
+// 0x3600…0000 shows THE SAME balance at 6 decimals. So Arc is a STABLE-lineage
+// deployment, not a Robinhood-lineage one: there is no wrapped 18-decimal USDC
+// (Circle says there will be none) and `weth` below is that 6-decimal face,
+// exactly as on Stable.
+//
+// The Uniswap addresses are Uniswap Labs' own canonical v3 deployment on 5042,
+// cross-checked three ways on 2026-09-16: every fee tier reports its canonical
+// spacing, and live pool addresses reproduce from the canonical
+// POOL_INIT_CODE_HASH. Do NOT call .WETH9() on the router, the position
+// manager or the quoter: all three return 0x8bcEaA40…7937f, a 53-byte stub
+// that reverts UnsupportedProtocolError() on every call. Live pools quote
+// against the USDC face directly.
 const ARC = {
   CHAIN: {
-    id: 5042002, hexId: '0x4cef52', name: 'ARC',
-    rpcUrl: 'https://rpc.testnet.arc.network',
-    explorer: 'https://testnet.arcscan.app',
+    id: 5042, hexId: '0x13b2', name: 'Arc',
+    rpcUrl: 'https://rpc.mainnet.arc.io',
+    // The only explorer Arc has, and it answers Circle's SSO login on every
+    // path today – see the long note in content/networks.mjs. It stays here so
+    // that every `${CHAIN.explorer}/address/…` link in the components is an
+    // absolute URL to the canonical host rather than a relative path into our
+    // own SPA, which is what an empty string would produce.
+    explorer: 'https://explorer.arc.io',
     currency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
   },
   ADDR: {
-    // LaunchFactory v3 (2026-09-12). The 2.1 dollar-economics factory 0x514488E3…
-    // and the earlier 0xB35963ED… keep serving the tokens they created (the
-    // backend indexes all three).
-    factory: '0x8dbbDD311927C7a34f802Fa3cCD4916742d65374', // LaunchFactory v3, 2026-09-12; the 2.1 factories 0x514488E3…/0xB35963ED… stay indexed by the backend
-    promotions: '0xFf8b0b4901ccaC881E7C5733ff8A321eA144C31B',
-    subdomains: '0xdd8715fa10C91ad22e15620023F4A70aDafF245E',
-    weth: '0x911b4000D3422F482F4062a913885f7b035382Df', // WUSDC (18 dec)
-    simpleTokenDeployer: '0x6E53cf0adb1A9640E1dCB7DD6ABF3d766Bcd02B6',
-    fairTokenDeployer: '0xD25857A5608f28B33354737DC471e1daf1382A1C', // v3 helper – curve vanity salts are mined against it
-    swapRouter: '0x509cF58CdA08C7aee83a2BdBb4A1Eac907343D01',
-    quoterV2: '0x121aeB6DEf00F6F67665008CaC1C19805886ed1a',
+    // Broadcast and live since 2026-09-16 (docs/deployments/arc-mainnet/
+    // addresses.env, LaunchFactory in block 21161925): the Stable-lineage
+    // contracts, EIP-55 spelled as they were compiled. The same five addresses
+    // are in the `contracts` block of the arc entry in src/content/networks.mjs
+    // – that block is THE source, and CONTRACTS_PENDING below is derived from
+    // it, not from this table. Only the three below live here; promotions and
+    // subdomains are registry-derived in the ADDR export, so there is nothing
+    // to paste twice and nothing to forget.
+    //
+    // The PENDING sentinel above is what these three held between "the flavour
+    // exists" and this broadcast: the zero address rather than null, because
+    // this table is typed as strings and read by encoders, by the CREATE2
+    // vanity miner and by every "open in explorer" link, and a null would have
+    // turned a build-time absence into a runtime TypeError far from here.
+    factory: '0xb122C3C07f7fFC0c72bE2AC1933a6D188ef09912',
+    weth: '0x3600000000000000000000000000000000000000', // USDC ERC-20 face (6d) – the pool quote asset; there is no WETH on Arc
+    simpleTokenDeployer: '0x6A4b2f1e771349Cfe2E4ea507e0651E8B3F2f35f',
+    fairTokenDeployer: '0x7bf697F9Eb52605fD1DCE1Cc9cbf94E289C85f06',
+    // Uniswap Labs canonical v3 on Arc mainnet (EIP-55 checksummed – the
+    // lowercase spelling of the quoter does not compile in Solidity, and the
+    // same casing is what the contracts were compiled against):
+    //   UniswapV3Factory            0xf0db7b58379503491d857dB50AC9ece64c653918
+    //   NonfungiblePositionManager  0x39654A85A4C05127f5Fd6ED22CAeC077A0fB1377
+    swapRouter: '0x53BF6B0684Ec7eF91e1387Da3D1a1769bC5A6F77', // SwapRouter02
+    quoterV2: '0x7DfD4F31be6814D2906BDE155c3e1B146EAc1468',
   },
 } as const;
 
@@ -120,7 +161,52 @@ export const CHAIN = NET.CHAIN;
  * It travels in THE network registry (content/networks.mjs) with the other
  * addresses so the API, the SDK manifests and the site cannot disagree.
  */
-export const ADDR = { ...NET.ADDR, zap: (NET_ENTRY.contracts.zap ?? null) as string | null };
+export const ADDR = {
+  ...NET.ADDR,
+  // Promotions and subdomains come from the registry, not from the tables
+  // above. They are the two addresses the site sends REAL money to without a
+  // simulation in front of it (Token.tsx doBoost / doTopSlot, msg.value 100
+  // and 50 units of the chain's coin), and a codeless recipient does not
+  // revert – a plain value transfer to an EOA-shaped address succeeds. So the
+  // "is it deployed" answer has to come from the same file that answers it for
+  // the factory, and PROMOTIONS_PENDING below turns that null into a gate.
+  promotions: (NET_ENTRY.contracts.promotions ?? PENDING) as string,
+  subdomains: (NET_ENTRY.contracts.subdomains ?? PENDING) as string,
+  zap: (NET_ENTRY.contracts.zap ?? null) as string | null,
+};
+
+/**
+ * Is this build pointed at launch contracts that are not on the chain yet?
+ *
+ * True only between "the flavour exists" and "the conductor broadcast it" –
+ * the state the Arc mainnet build is in until the addresses land in the arc
+ * entry of content/networks.mjs. The registry is the thing asked, not the ADDR
+ * table: the registry says null for a contract that was never broadcast, while
+ * ADDR holds PENDING so the typed reads downstream keep working. Anything that
+ * is about to offer the user a transaction gates on this instead of
+ * rediscovering the zero address for itself (Create.tsx).
+ *
+ * EVERY launch-side slot is asked, not just the factory. Asking the factory
+ * alone meant that the first half of a broadcast – factory pasted, promotions
+ * not – would flip this to false and re-open a boost button pointed at
+ * 0x0000…0000, which does not revert.
+ */
+const PENDING_SLOTS = [
+  NET_ENTRY.contracts.factory,
+  NET_ENTRY.contracts.simpleTokenDeployer,
+  NET_ENTRY.contracts.fairTokenDeployer,
+  NET_ENTRY.contracts.promotions,
+  NET_ENTRY.contracts.subdomains,
+];
+export const CONTRACTS_PENDING: boolean = PENDING_SLOTS.some((a) => a == null);
+
+/**
+ * The narrower question for the promotion controls alone: is OpenPromotions on
+ * this chain? boost() and buyTopSlot() are the only writes the site makes with
+ * a hard-coded price and NO simulateContract in front of them, so this is the
+ * gate that stands between "not deployed yet" and 100 USDC sent to nowhere.
+ */
+export const PROMOTIONS_PENDING: boolean = NET_ENTRY.contracts.promotions == null;
 
 /**
  * Does the factory in THIS build's ADDR table speak the quote-pairs generation
@@ -147,7 +233,15 @@ export const ADDR = { ...NET.ADDR, zap: (NET_ENTRY.contracts.zap ?? null) as str
 const QUOTE_AWARE_TABLE: Record<string, boolean> = {
   robinhood: true, // LaunchFactory v3, live 2026-09-10
   stable: false,
-  arc: true, // LaunchFactory v3 on Arc testnet, 2026-09-12 (registry empty – quote pairs stay off, native launches use the v3 structs)
+  // Arc mainnet runs the STABLE lineage (factoryVersion 2.1): the 6-decimal
+  // USDC face needs the rescaled sqrtPrice math, and the v3 quote-pairs
+  // generation has not been ported to it. So the 23-field pre-v3 structs are
+  // the shape of every create here, and the vanity miner mines against the
+  // pre-v3 constructor arity (lib/vanity.ts STATIC_TABLE_QUOTE_AWARE). The
+  // factory broadcast on 2026-09-16 is that 2.1 lineage, so this row did not
+  // move with it; flip it the same day a v3 factory address replaces the one
+  // above, not before.
+  arc: false,
 };
 export const STATIC_FACTORY_QUOTE_AWARE: boolean = QUOTE_AWARE_TABLE[NET_KEY] ?? false;
 
@@ -166,14 +260,17 @@ export const STATIC_FACTORY_QUOTE_AWARE: boolean = QUOTE_AWARE_TABLE[NET_KEY] ??
  * lib/exploreApi.ts crowdLaunchEnabled). Where the row is false the runtime
  * factory address is not "overridden" – it is not looked at.
  *
- * Keyed by chain for the same reason QUOTE_AWARE_TABLE is: it moves with the
- * ADDR table above, in the same edit, and back on a rollback.
+ * The rows live in THE network registry (content/networks.mjs `crowd`), next
+ * to `quotePairs` and `bridge`, and are read here rather than retyped. That is
+ * not tidiness: scripts/prerender.mjs is plain ESM and cannot import this file,
+ * so a table kept only here left the prerendered HTML with no way to ask the
+ * question – which is how stable.openfair.app came to publish an article step
+ * describing a launch mode the host has no contracts for. One flag, three
+ * readers (this bundle, the prerender's [[crowd]] blocks, the backend).
  */
-const CROWD_TABLE: Record<string, boolean> = {
-  robinhood: true, // CrowdFactory 0xB70bAa29…03f6, live 2026-09-10
-  stable: false,
-  arc: true, // CrowdFactory on Arc testnet, 2026-09-12
-};
+const CROWD_TABLE: Record<string, boolean> = Object.fromEntries(
+  REGISTRY.map((n) => [n.key, n.crowd === true]),
+);
 export const STATIC_CROWD_SUPPORTED: boolean = CROWD_TABLE[NET_KEY] ?? false;
 
 /**
@@ -222,37 +319,118 @@ export const TOP_SLOT_PRICE_ETH = ECON.topSlot;
 /** Native-currency ticker for fee lines / amounts (ETH or USDT0). */
 export const CUR = CHAIN.currency.symbol;
 
-/** Whether this build's chain has a native bridge page (Robinhood only:
- *  Stable has no Arbitrum route, Arc is a faucet-funded testnet). Read from
+/** Whether this build's chain has a bridge page. Robinhood's is the Arbitrum
+ *  canonical portal, Arc's is Relay plus Circle's CCTP bridge; Stable has
+ *  neither (USDT0 arrives through usdt0.to). Read from
  *  the registry's `bridge` flag – the same field scripts/prerender.mjs (which
  *  files to write) and the backend sitemap (which URLs to list) read, so the
  *  route, the prerendered file and the sitemap entry cannot disagree. */
 export const HAS_BRIDGE: boolean = NET_ENTRY.bridge === true;
 
-/** Testnet builds: money is faucet play-money, so real-value framing is wrong. */
-export const IS_TESTNET = IS_ARC;
+/**
+ * Can a reader actually open this chain's block explorer?
+ *
+ * CHAIN.explorer is always a URL – components build `${explorer}/address/…`
+ * links from it and an empty string would turn every one of them into a
+ * relative path into our own SPA. But on Arc the only explorer that exists,
+ * explorer.arc.io (the host Circle's docs, Uniswap's chain config and Relay
+ * all name), answers a Cloudflare Access login for Circle SSO on every path,
+ * /api/v2 included. So the link is correct and the promise is not: a surface
+ * that tells a reader "look it up in the explorer" asks THIS first, and
+ * offers the DexScreener pair page or the Uniswap token page instead.
+ *
+ * Read from the registry so one edit re-opens every such surface on the day
+ * Circle opens the explorer.
+ */
+export const EXPLORER_PUBLIC: boolean = NET_ENTRY.explorerPublic !== false;
 
-/** Where testnet users get gas. Null on real-money chains. */
-export const FAUCET_URL: string | null = IS_ARC ? 'https://faucet.circle.com/' : null;
+/**
+ * Testnet builds: money is faucet play-money, so real-value framing is wrong.
+ *
+ * Read from the registry's own `testnet` flag rather than written as "which
+ * chain is it" – that equality (IS_TESTNET = IS_ARC) survived the day Arc
+ * stopped being a testnet, which is exactly the class of bug the registry
+ * exists to prevent. Every deployment is a mainnet today; the constant stays
+ * because the next chain added may not be.
+ */
+export const IS_TESTNET: boolean = NET_ENTRY.testnet === true;
+
+/** Where testnet users get gas. Null on real-money chains – which, since the
+ *  Arc cutover to chain 5042 on 2026-09-16, is all of them. USDC on Arc
+ *  mainnet is real money and has no faucet; the page that answers "how do I
+ *  get funds here" is /bridge. */
+export const FAUCET_URL: string | null = null;
 
 /** External DEX deep-link for a graduated/instant token, or null when the
- *  chain has no public swap UI (Arc testnet). Used for "Trade on …" buttons. */
-export const DEX_SWAP_URL: ((token: string) => string) | null = IS_ARC
-  ? null
-  : IS_STABLE
-    ? (t: string) => `https://swap.stable.xyz/#/swap?outputCurrency=${t}`
-    : (t: string) => `https://app.uniswap.org/swap?chain=robinhood&outputCurrency=${t}`;
+ *  chain has no public swap UI. Used for "Trade on …" buttons. Arc is a
+ *  first-class chain in Uniswap's own interface (urlParam 'arc'), and its
+ *  pools quote against the USDC face directly, so the ordinary app.uniswap.org
+ *  deep link works with no inputCurrency pinned. */
+export const DEX_SWAP_URL: ((token: string) => string) | null = NET_ENTRY.dexSwapUrl
+  ? (tok: string) => `${NET_ENTRY.dexSwapUrl}${tok}`
+  : null;
 
-/** DexScreener chart slug, or null where the chain is not covered. */
-export const DEXSCREENER_SLUG: string | null = IS_ARC ? null : IS_STABLE ? null : 'robinhood';
+/** DexScreener chart slug, or null where the chain is not covered. Arc is
+ *  indexed: both the v1 token-pairs endpoint and the older pairs endpoint
+ *  answered for chain slug 'arc' on 2026-09-16 with live Uniswap v3 and v4
+ *  pairs, and every pair object's own `url` is dexscreener.com/arc/<pair>. */
+export const DEXSCREENER_SLUG: string | null = NET_ENTRY.dexscreenerSlug ?? null;
+
+/**
+ * Public "view this token" page for a chain with no public block explorer, or
+ * null where the explorer IS that page. Read by lib/explorer.ts, which is the
+ * only thing that should be deciding where a "view" control points.
+ */
+export const DEX_TOKEN_URL: ((token: string) => string) | null = NET_ENTRY.dexTokenUrl
+  ? (tok: string) => `${NET_ENTRY.dexTokenUrl}${tok}`
+  : null;
+
+/**
+ * The pool-side asset of a NATIVE launch – `ADDR.weth` – described.
+ *
+ * `decimals` is the scale an amount on that side is parsed and printed at. It
+ * is SIX on Stable and Arc, where the "wrapped native" is really the native
+ * coin's own ERC-20 face, and reading 18 there is not a rounding error: it is
+ * 1e12 times the amount the user typed, quoted and then spent.
+ *
+ * `wrapped` is the other half of the same fact. A real WETH9 lets the router
+ * take msg.value and wrap it (and unwrapWETH9 on the way out); a face has
+ * nothing to wrap, so the swap is an ordinary ERC-20 swap with an allowance
+ * and no value. Sending msg.value to a router that then pulls the same amount
+ * by transferFrom spends the balance twice.
+ *
+ * Both come from the registry so the site and the SDK cannot disagree.
+ */
+export const NATIVE_QUOTE_DECIMALS: number = NET_ENTRY.nativeQuote.decimals;
+export const NATIVE_QUOTE_WRAPPED: boolean = NET_ENTRY.nativeQuote.wrapped;
+
+/** Where this chain's contracts are verified, and under what name: the block
+ *  explorer where there is a public one, Sourcify on Arc. Injected into the
+ *  locale strings as {verifyName}/{verifyUrl} (lib/i18n.ts) so no dictionary
+ *  carries a chain's explorer host as a literal – which is how ten locales
+ *  came to promise Blockscout on a chain that has none. */
+export const VERIFY_NAME: string = NET_ENTRY.verify.name;
+export const VERIFY_URL: string = NET_ENTRY.verify.url;
+
+/** This deployment's own machine surfaces: the versioned REST base and the MCP
+ *  endpoint. Injected into prose as {apiHost}/{mcpHost} (lib/i18n.ts,
+ *  scripts/prerender.mjs) for the same reason {verifyName} exists – four blog
+ *  articles printed `https://api.openfair.app` and `https://mcp.openfair.app`
+ *  as literals, which are the Robinhood deployment's subdomains and answer
+ *  nothing for a reader on Stable or Arc. The registry carries one base per
+ *  chain (`api` / `mcp`), so a path appended to either of these is the path
+ *  THIS backend serves. */
+export const API_BASE: string = NET_ENTRY.api;
+export const MCP_BASE: string = NET_ENTRY.mcp;
 
 // Sibling deployments for the header network switcher, derived from THE
 // network registry (src/content/networks.mjs – the single source of truth
 // that also feeds the API/SDK/MCP/embed surfaces). Each network is its own
 // domain (own build + backend + DB); switching navigates across domains.
-// The switcher is the ONE place that flags a testnet – everywhere else the
-// chain is written plainly (titles, prose, fee lines), so the site reads the
-// same on Arc as on a mainnet.
+// The switcher is the ONE place that would flag a testnet – everywhere else
+// the chain is written plainly (titles, prose, fee lines). No deployment is a
+// testnet since the Arc cutover, so the branch renders nothing today; it stays
+// for the next chain that is one.
 export const NETWORK_SITES = REGISTRY.map((n) => ({
   id: n.chainId,
   label: n.testnet ? `${n.name} (Testnet)` : n.name,

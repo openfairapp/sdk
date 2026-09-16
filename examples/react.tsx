@@ -2,7 +2,7 @@
 import { useState } from 'react';
 import { Openfair, type ProgressEvent } from '@openfair/sdk';
 
-// Robinhood Chain by default; { chainId: 988 } targets Stable, { chainId: 5042002 } Arc.
+// Robinhood Chain by default; { chainId: 988 } targets Stable, { chainId: 5042 } Arc.
 const sdk = new Openfair({ referrer: '0xYourReferralWallet' });
 
 export function LaunchButton() {

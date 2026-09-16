@@ -2,7 +2,7 @@
 // (Launching from Node requires an EIP-1193 provider you control.)
 import { Openfair, CHAIN_MANIFESTS, SDK_VERSION } from '@openfair/sdk';
 
-// One manifest per chain the SDK ships: Robinhood Chain (4663), Stable (988), Arc (5042002).
+// One manifest per chain the SDK ships: Robinhood Chain (4663), Stable (988), Arc (5042).
 console.log(`sdk ${SDK_VERSION}:`, Object.values(CHAIN_MANIFESTS).map((m) => `${m.name} (${m.chainId})`).join(', '));
 
 const sdk = new Openfair(); // Robinhood Chain; `new Openfair({ chainId: 988 })` targets Stable
