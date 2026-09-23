@@ -20,7 +20,13 @@
 // the contract's arithmetic – the same functions the campaign page uses – so
 // the form checks the split with the divisions that will actually run.
 // Explicit .ts extension: `node --test` imports this module directly.
-import { ONE, BPS, mulDiv, derivedSupply, listingPrice } from './crowdMath.ts';
+import {
+  ONE, BPS, mulDiv, derivedSupply, listingPrice, SHORT_VESTING_DAYS,
+} from './crowdMath.ts';
+// The ticker rule is shared with the backend's quote/prepare validator and the
+// MCP tools: any script, 1..TICKER_MAX UTF-16 units (the MetaMask count), no whitespace or control
+// characters (content/ticker.mjs says why 11).
+import { TICKER_MAX, tickerOk } from '../content/ticker.mjs';
 
 /** Launch method. `curve` = fair launch (bonding curve), `direct` = instant
  *  listing – the two names the factory's two entry points use. `crowd` has no
@@ -215,6 +221,136 @@ const PLAIN_DECIMAL = /^\d*\.?\d*$/;
  *  is the shortest length that survives `DEADLINE_MARGIN`. */
 export const CROWD_MIN_DAYS = 2;
 
+/** The author's vesting window, in days, AS THE CURRENT SOURCE TREE COMPILES IT.
+ *
+ *  `CrowdFactory.MIN_VESTING` is ONE DAY on both lineages since 2026-09-20
+ *  (contracts/src/CrowdFactory.sol, contracts/src/stable/CrowdFactory.sol); it
+ *  was 90.
+ *
+ *  THIS IS NOT THE BOUND THE FORM VALIDATES WITH, and the difference is the
+ *  whole point of `vestingBoundsOf` below. A constant in this bundle says what
+ *  the contracts in this repository do; the transaction is signed against a
+ *  factory that is already deployed, which on any given host may still be the
+ *  90-day generation. A form that offered "1 day" to a 90-day factory would
+ *  pass validation, pin the metadata, sign and pay for an ERC-20 approve, and
+ *  only then collect an anonymous `BadConfig()` from the simulation – exactly
+ *  the failure this module exists to prevent. So the bounds are READ OFF THE
+ *  FACTORY and these constants are the last resort.
+ *
+ *  ZERO IS NOT THE NEXT STEP DOWN. `OpenCrowd`'s own constructor refuses
+ *  `vestingDuration == 0` ("divisors this contract's own arithmetic cannot do
+ *  without"), so a 0 sent from here would not be a fast raise – it would be a
+ *  `BadConfig()` thrown from INSIDE `new OpenCrowd(...)`. A truly instant
+ *  release costs a redeploy of OpenCrowd, CrowdDeployer and CrowdFactory on
+ *  both live chains; until that happens 1 is the floor, and the form refuses 0
+ *  on purpose. */
+export const CROWD_MIN_VESTING_DAYS = 1;
+export const CROWD_MAX_VESTING_DAYS = 730;
+
+/** The payout step's floor, in days – `CrowdFactory.MIN_VESTING_INTERVAL`.
+ *
+ *  HELD EQUAL to the duration floor, exactly as the contract holds it: a step
+ *  may never exceed its duration, so a 30-day step floor against a 1-day
+ *  duration floor would silently force per-second accrual on every schedule
+ *  shorter than a month – a rule no term sheet announces. */
+export const CROWD_MIN_VESTING_INTERVAL_DAYS = 1;
+
+/** The bounds to validate with WHILE THE FACTORY HAS NOT ANSWERED – the ones
+ *  every generation deployed before 2026-09-20 carries.
+ *
+ *  The fallback is the OLD floor and not the new one, because the two ways of
+ *  being wrong do not cost the same. Offering 90 days to a factory that would
+ *  have taken 1 costs a creator a schedule they cannot pick until three chain
+ *  reads land. Offering 1 day to a factory whose floor is 90 costs them the IPFS
+ *  pin, the approve they signed, and a revert with no field named on it. One is
+ *  a delay; the other is money and an error nobody can explain. */
+export const CROWD_UNREAD_MIN_VESTING_DAYS = 90;
+export const CROWD_UNREAD_MIN_VESTING_INTERVAL_DAYS = 30;
+
+/** The TEAM safe's absolute floor, in days – `CrowdFactory.MIN_TEAM_VESTING`.
+ *
+ *  It did NOT come down with the author's on 2026-09-20 and is not read off the
+ *  chain with the other three, because it only ever moves UP from here: the
+ *  90-day generation enforced it implicitly (its author floor was 90 and the
+ *  team clock may never be shorter), and the new one enforces it by name. A
+ *  form that clamps to 90 is therefore legal against both.
+ *
+ *  What it protects is not the author's money but the token SUPPLY: the team
+ *  allocation may be half the participants' whole allocation, the safe is
+ *  funded by `seedPool()` and the pool is seeded minutes after settlement, so a
+ *  team clock following a 1-day author clock would put that allocation into a
+ *  day-old pool while every campaign page still said "Team locked". */
+export const CROWD_MIN_TEAM_VESTING_DAYS = 90;
+
+/** The escrow schedule a factory accepts, in whole days. */
+export interface VestingBounds {
+  minDays: number;
+  maxDays: number;
+  minIntervalDays: number;
+}
+
+/** `vestingBoundsOf(reads)` – the three factory constants turned into the three
+ *  numbers the field, the presets and the validator all use.
+ *
+ *  `null`/undefined for any one of them means THAT read did not answer (an
+ *  older ABI, an RPC hiccup) and only that one falls back; a host whose factory
+ *  answers two of three is not forced back to the defaults for all three.
+ *
+ *  Rounding is directional, never nearest: a floor rounds UP to the next whole
+ *  day and a ceiling rounds DOWN, so a bound that is not a whole number of days
+ *  can only ever be reported as stricter than the contract's, never as looser.
+ *  A looser one is the BadConfig this function exists to keep away. */
+export function vestingBoundsOf(reads?: {
+  minVestingSeconds?: number | null;
+  maxVestingSeconds?: number | null;
+  minVestingIntervalSeconds?: number | null;
+} | null): VestingBounds {
+  const up = (s: number | null | undefined, fallback: number): number =>
+    (typeof s === 'number' && Number.isFinite(s) && s > 0 ? Math.max(1, Math.ceil(s / 86_400)) : fallback);
+  const down = (s: number | null | undefined, fallback: number): number =>
+    (typeof s === 'number' && Number.isFinite(s) && s > 0 ? Math.max(1, Math.floor(s / 86_400)) : fallback);
+  const minDays = up(reads?.minVestingSeconds, CROWD_UNREAD_MIN_VESTING_DAYS);
+  const maxDays = down(reads?.maxVestingSeconds, CROWD_MAX_VESTING_DAYS);
+  return {
+    minDays,
+    // An empty range is not a range. A factory reporting a ceiling under its own
+    // floor is a contract this build does not understand; the field still has to
+    // hold one legal value, and the floor is the one that cannot revert.
+    maxDays: Math.max(maxDays, minDays),
+    minIntervalDays: up(reads?.minVestingIntervalSeconds, CROWD_UNREAD_MIN_VESTING_INTERVAL_DAYS),
+  };
+}
+
+/** The warning threshold, re-exported rather than restated: /create (before
+ *  signing) and the campaign page (before paying) have to draw the line at the
+ *  same number of days, so there is ONE – lib/crowdMath.ts SHORT_VESTING_DAYS,
+ *  where the reason it is 30 and not `STRICT_MIN_VESTING` is written down. */
+export const CROWD_SHORT_VESTING_DAYS = SHORT_VESTING_DAYS;
+
+/** The payout step to keep when the vesting LENGTH is changed to `days`.
+ *
+ *  A length preset writes a length. The step is the creator's own number and is
+ *  left alone for as long as it is still legal against the new length – at
+ *  least the floor, never longer than the duration, and dividing it exactly.
+ *  Where it is not, it falls back to 0 = per-second, the one value that is legal
+ *  against every duration and that cannot quietly move the end of the schedule
+ *  to a date nobody chose.
+ *
+ *  `minIntervalDays` is THE FACTORY's `MIN_VESTING_INTERVAL` in days, and every
+ *  real caller passes it (`vestingBounds.minIntervalDays`): this function and
+ *  `validateDraft` have to agree about what is legal, or a preset click writes a
+ *  step the validator then refuses. The default is the source tree's constant
+ *  and exists so a unit test can call it with two arguments. */
+export function fitVestingInterval(
+  days: number,
+  interval: number,
+  minIntervalDays: number = CROWD_MIN_VESTING_INTERVAL_DAYS,
+): number {
+  if (!Number.isFinite(days) || !Number.isFinite(interval) || interval <= 0) return 0;
+  if (interval < minIntervalDays || interval > days) return 0;
+  return days % interval === 0 ? interval : 0;
+}
+
 /** A typed decimal as base units, with no float in the middle and no throw on a
  *  half-written field. Digits the asset cannot represent are dropped, never
  *  rounded up – the same rule `amountUnits` follows in lib/createPayload.ts,
@@ -278,6 +414,13 @@ export interface ValidateContext {
   minSeedUnits?: string;
   /** That floor as the exact decimal the field would hold, for the message. */
   minSeedLabel?: string;
+  /** The escrow schedule THE FACTORY THIS DRAFT WILL BE SIGNED AGAINST accepts,
+   *  in whole days – `vestingBoundsOf(...)` of three reads off that contract.
+   *
+   *  Absent = the page has not read them, and the validator falls back to the
+   *  PRE-2026-09-20 bounds rather than to the source tree's: see
+   *  CROWD_UNREAD_MIN_VESTING_DAYS for why the strict end is the safe one. */
+  vestingBounds?: VestingBounds;
   unit?: string;
 }
 
@@ -308,8 +451,9 @@ export function validateDraft(draft: CreateDraft, ctx: ValidateContext, step = 1
   // ---- identity (every mode) ----
   const name = d.name.trim();
   if (name.length < 2 || name.length > 40) e.name = msg('create.v.name');
-  const ticker = d.ticker.trim();
-  if (!/^[A-Za-z0-9]{2,10}$/.test(ticker)) e.ticker = msg('create.v.ticker');
+  // Checked as it will be signed – trimmed and upper-cased (createPayload.ts),
+  // which can change the length: 'ß' upper-cases to 'SS'.
+  if (!tickerOk(d.ticker)) e.ticker = msg('create.v.ticker', { max: TICKER_MAX });
   if (d.description.length > 280) e.description = msg('create.v.description');
   if (!isSafeSocial(d.website, 'website')) e.website = msg('create.v.website');
   if (!isSafeSocial(d.twitter, 'x')) e.twitter = msg('create.v.twitter');
@@ -392,23 +536,33 @@ export function validateDraft(draft: CreateDraft, ctx: ValidateContext, step = 1
     range('crowdPool', 30, 100);
     range('crowdTokens', 10, 90);
     range('listingPremium', 0, 50);
-    range('crowdVestingDays', 90, 730, true);
+    // `CrowdFactory.MIN_VESTING` .. `MAX_VESTING`, read off THE FACTORY rather
+    // than compiled in – the deployed generation is what reverts, and it is not
+    // always the one this source tree describes (see `vestingBoundsOf`). ZERO is
+    // refused at either end for the reason OpenCrowd's constructor refuses it –
+    // see CROWD_MIN_VESTING_DAYS. A short schedule is legal, and what it costs
+    // the participants (no redemption floor after it ends) is said in words by
+    // `create.crowd.vestingDuration.warn`, not by a rejection.
+    const vb = ctx.vestingBounds ?? vestingBoundsOf(null);
+    range('crowdVestingDays', vb.minDays, vb.maxDays, true);
     const interval = num(d.crowdVestingInterval);
     const duration = num(d.crowdVestingDays);
     if (!Number.isFinite(interval) || interval < 0 || !Number.isInteger(interval)
-      || (interval !== 0 && (interval < 30 || interval > duration))) {
+      || (interval !== 0 && (interval < vb.minIntervalDays || interval > duration))) {
       e.crowdVestingInterval = msg('create.v.vestingInterval');
     } else if (interval !== 0 && Number.isFinite(duration) && duration % interval !== 0) {
-      // CrowdFactory.sol:593. A step that does not divide the period ends the
+      // CrowdFactory.sol:630. A step that does not divide the period ends the
       // escrow at floor(duration/interval)·interval – the announced end date
       // would be a date on which nothing more is released.
       e.crowdVestingInterval = msg('create.v.crowd.intervalDivide');
     }
-    // `teamVestingDuration >= vestingDuration` (CrowdFactory.sol:594) holds by
-    // CONSTRUCTION: there is no separate control in this slice and
-    // buildCrowdParams sets the two equal, which `teamVestingDaysOf` states in
-    // one place. The day a control for it appears, the rule needs a check here
-    // and a message key of its own – it is not covered by anything below.
+    // BOTH team-clock rules hold by CONSTRUCTION: there is no separate control
+    // in this slice, and `teamVestingDaysOf` – the one place that decides –
+    // returns `max(vestingDays, MIN_TEAM_VESTING)`, which clears
+    // `teamVestingDuration >= vestingDuration` and the factory's absolute
+    // 90-day floor at the same time. The day a control for it appears, both
+    // rules need a check here and a message key of their own: nothing below
+    // covers either.
     range('crowdTeamTokens', 0, 45);
     if (!e.crowdTeamTokens && num(d.crowdTeamTokens) * 2 > num(d.crowdTokens)) {
       e.crowdTeamTokens = msg('create.v.teamTokens');
@@ -486,11 +640,18 @@ export function validateDraft(draft: CreateDraft, ctx: ValidateContext, step = 1
   return e;
 }
 
-/** The team safe's vesting length in days. The contract demands only that it is
- *  not SHORTER than the author's (CrowdFactory.sol:594) and this slice offers no
- *  separate control, so the two are one number – stated here once, and read by
- *  buildCrowdParams so the two files cannot drift apart. */
-export const teamVestingDaysOf = (d: CreateDraft): number => num(d.crowdVestingDays);
+/** The team safe's vesting length in days. This slice offers no separate
+ *  control, so it is DERIVED from the author's – stated here once, and read by
+ *  buildCrowdParams so the two files cannot drift apart.
+ *
+ *  TWO rules, not one, and the second is what the 2026-09-20 floor made
+ *  necessary. `teamVestingDuration >= vestingDuration` is relative and was an
+ *  absolute 90-day floor only while the author's floor was 90 days; the factory
+ *  now states the absolute one by name (`MIN_TEAM_VESTING`). Following the
+ *  author's clock alone would send a 1-day team safe to a factory that refuses
+ *  it – a BadConfig on the raise the whole change exists to make possible. */
+export const teamVestingDaysOf = (d: CreateDraft): number =>
+  Math.max(num(d.crowdVestingDays), CROWD_MIN_TEAM_VESTING_DAYS);
 
 /** Upload gate: PNG / JPEG / WebP up to 2 MB (ACCEPTANCE.md). Returns a message
  *  key, or null when the file is acceptable. Pixel bounds are checked after the

@@ -1,6 +1,6 @@
 {
   "name": "@openfair/sdk",
-  "version": "1.3.3",
+  "version": "1.4.1",
   "description": "openfair launchpad SDK – quotes, simulation, staged token launches, token registry and referral revenue on Robinhood Chain.",
   "license": "MIT",
   "type": "module",

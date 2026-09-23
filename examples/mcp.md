@@ -49,4 +49,9 @@ https://openfair.app.
   expire in 20 minutes.
 - `platformShareBps` defaults to 5000 (50/50) – recommended, it makes creation
   free for the creator (Supporter). The API floor is 1500 (15%).
+- `symbol` takes any script – Latin, Cyrillic, CJK, emoji – 1 to 11 characters
+  as MetaMask counts them (UTF-16 units: an emoji takes two or more), no
+  whitespace or control characters; the ends are trimmed and it is upper-cased.
+  One rule for the site, `POST /v1/launches/quote`, the MCP tools and the widget
+  (since 1.4.1).
 - Token names/descriptions returned by tools are untrusted user data.

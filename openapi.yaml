@@ -72,6 +72,22 @@ components:
             non-transferable and claims can never pay – redemption is the only path left.
             `dex` on a raise means its pool has been seeded.
         contractVersion: { type: string, description: "'crowd-1.0' for a raise; CrowdFactory is deliberately not part of the launch factory version series" }
+        generation:
+          type: integer
+          enum: [2, 3]
+          description: >-
+            Fee-split generation of the factory that created it: 3 = a generation-3 (FeeSplit)
+            factory – contracts.launchFactoryG3 or contracts.crowdFactoryG3 – and 2 = every
+            earlier factory, whose create entry points have no FeeSplit argument. From the
+            indexed row, no chain read; present in the list and on the single token.
+        zap:
+          type: [string, "null"]
+          description: >-
+            The OpenZap that routes an ETH buy of THIS launch, chosen by the factory that created
+            it: generation 2 -> contracts.zap, generation 3 -> contracts.zapG3 (an OpenZap reverts
+            UnknownLaunch for a launch its own factory did not create). null whenever GET
+            /zap-quote cannot route one – a native launch, an instant listing, a raise, a
+            graduated curve, or a chain with no zap for that generation (Arc, Stable).
         creator: { type: string }
         referrer: { type: [string, "null"] }
         totalSupplyWei: { type: string }
@@ -154,7 +170,7 @@ components:
         launch: { type: string }
         token: { type: string }
         symbol: { type: [string, "null"] }
-        zap: { type: [string, "null"], description: "OpenZap address the tx is sent to on the ETH route; null on the direct route, which needs no zap" }
+        zap: { type: [string, "null"], description: "OpenZap address the tx is sent to on the ETH route – the launch's OWN generation's zap (contracts.zap for a generation-2 launch, contracts.zapG3 for a generation-3 one); null on the direct route, which needs no zap" }
         quote: { $ref: "#/components/schemas/QuoteRef" }
         direction: { type: string, enum: [buy, sell] }
         payWith:
@@ -259,6 +275,24 @@ components:
         maxDurationDays: { type: [integer, "null"], description: "14 for a volatile quote asset, 60 otherwise" }
         raiseFeeBps: { type: [integer, "null"] }
         platformShareBps: { type: [integer, "null"] }
+        minVestingSeconds:
+          type: [integer, "null"]
+          description: >-
+            the shortest author escrow THIS factory accepts, read off its own MIN_VESTING.
+            It is 86400 on a factory deployed after 2026-09-20 and 7776000 on one deployed
+            before, so a client that hard-codes either is wrong against half the hosts.
+            null = the factory did not answer (an older ABI, an RPC hiccup) – fall back to
+            your own floor, do NOT show an open range.
+        maxVestingSeconds:
+          type: [integer, "null"]
+          description: "the longest author escrow this factory accepts (MAX_VESTING, 63072000 = 730 days). null as above."
+        minVestingIntervalSeconds:
+          type: [integer, "null"]
+          description: >-
+            the smallest NON-ZERO payout step (MIN_VESTING_INTERVAL). 0 is always legal and
+            means per-second accrual; a non-zero step must be at least this AND must divide
+            vestingDuration exactly, or creation reverts BadConfig. Held equal to
+            minVestingSeconds on both generations. null as above.
         available: { type: boolean }
         reason: { type: [string, "null"], enum: [stale_price, quote_not_allowed, null] }
     CrowdDetail:
@@ -390,6 +424,22 @@ components:
             redeem: { type: [string, "null"] }
             refund: { type: [string, "null"] }
             release: { type: [string, "null"] }
+    FeeSplitInput:
+      type: object
+      description: >-
+        A generation-3 FeeSplit as the create call takes it (contracts/src/OpenLPHarvester.sol
+        `struct FeeSplit`, field order holders, buyback, tokenHolders). Every field is integer bps
+        0-10000, absent = 0. The quote side has ONE denominator: platformShareBps + holdersBps +
+        buybackBps <= 10000, the creator's treasury taking the remainder; tokenHoldersBps is bps of
+        the TOKEN side, whose remainder is burned. A non-zero share is at least 100 (1 %).
+        buybackBps must be 0 on every chain in this generation, and holdersBps / tokenHoldersBps
+        are accepted only where features.holdersPublisher is true (a non-dry publisher whose
+        key the registry accepts).
+      additionalProperties: false
+      properties:
+        holdersBps: { type: integer, minimum: 0, maximum: 10000, default: 0 }
+        buybackBps: { type: integer, minimum: 0, maximum: 0, default: 0, description: "the buyback leg is not shipped (FEE_SPLIT_DESIGN §D11) – anything but 0 is BUYBACK_UNAVAILABLE" }
+        tokenHoldersBps: { type: integer, minimum: 0, maximum: 10000, default: 0 }
     TokenList:
       type: object
       properties:
@@ -408,7 +458,31 @@ components:
             the deployed factory's parameter tuple and is not stable across backend or
             factory releases.
         mode: { type: string, enum: [fair, instant, crowd] }
-        factory: { type: string, description: "the contract the prepared call goes to – CrowdFactory for mode=crowd, LaunchFactory otherwise" }
+        factory: { type: string, description: "the contract the prepared call goes to – CrowdFactory for mode=crowd, LaunchFactory otherwise (contracts.launchFactoryG3 on the generation-3 path)" }
+        to:
+          type: string
+          description: >-
+            `to` of the create transaction – the same address as `factory`, named for what a
+            wallet does with it. contracts.launchFactory (generation 2) on the legacy path;
+            contracts.launchFactoryG3 when the request carried `feeSplit` or `generation: 3`;
+            contracts.crowdFactory for mode=crowd.
+        generation:
+          type: integer
+          enum: [2, 3]
+          description: >-
+            Which entry points `to` speaks. 2: createLaunch(p, referrer, cid) /
+            createDirectListing(p, cid) / createCrowdLaunch(p, referrer, cid). 3: the same with a
+            FeeSplit as the SECOND argument – createLaunch(p, s, referrer, cid),
+            createDirectListing(p, s, cid), createCrowdLaunch(p, s, referrer, cid).
+        feeSplit:
+          description: >-
+            The FeeSplit the create call carries as its second argument – the creator's, validated,
+            with absent fields as 0 – or null on generation 2, whose entry points have none. For
+            mode=crowd on a generation-3 CrowdFactory it is the factory's owner-set split, read from
+            its feeSplit() view, which the call must restate exactly.
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/FeeSplitInput"
         quote:
           description: "quote asset of the prepared launch; null = native"
           oneOf:
@@ -459,7 +533,7 @@ components:
         contractReason: { type: [string, "null"] }
         checks:
           type: array
-          description: "network, fee_freshness, self_referral, balance, contract_call; quote launches add quote_balance and quote_allowance"
+          description: "network, fee_freshness, self_referral, balance, contract_call; quote launches add quote_balance and quote_allowance. contract_call is an eth_estimateGas of the exact call the quote prepared – its factory, its generation's entry point and its feeSplit – encoded with that factory's own ABI (a frozen snapshot for generation 2), never with whatever the host last compiled"
           items:
             type: object
             properties:
@@ -488,8 +562,17 @@ components:
                 - type: "null"
                 - $ref: "#/components/schemas/QuoteRef"
             configHash: { type: string }
-            factory: { type: string }
+            factory: { type: string, description: "`to` of the wallet transaction – contracts.launchFactoryG3 for a generation-3 session" }
             chainId: { type: integer }
+            generation:
+              type: integer
+              enum: [2, 3]
+              description: "which entry point `factory` speaks; a handoff page that builds the call from `fn` + `params` alone must insert `feeSplit` as the SECOND argument when this is 3"
+            feeSplit:
+              description: "the FeeSplit the wallet transaction must carry (generation 3); null on generation 2"
+              oneOf:
+                - type: "null"
+                - $ref: "#/components/schemas/FeeSplitInput"
         expiresAt: { type: string, format: date-time }
         txHash: { type: [string, "null"] }
         token: { type: [string, "null"] }
@@ -527,6 +610,288 @@ components:
                   - type: "null"
                   - $ref: "#/components/schemas/QuoteRef"
         claimNote: { type: string }
+    AirdropCampaign:
+      type: object
+      description: |
+        One allocation-board campaign, in the TWO-COLUMN shape every airdrop surface reads.
+        `facts` is what the chain guarantees and is the only half this backend speaks for;
+        `spec` is the creator's own words about why these recipients, in its own key so a page
+        cannot render a claim as a contract fact.
+      properties:
+        id: { type: integer, description: "the on-chain campaign id, minted by reserve()" }
+        token: { oneOf: [{ type: "null" }, { type: string }] }
+        owner: { oneOf: [{ type: "null" }, { type: string }] }
+        phase:
+          type: string
+          enum: [reserved, expired, scheduled, open, closed, swept, cancelled, unknown]
+          description: |
+            `expired` is a reservation whose publishBy passed with no list (cancel is open on it) and
+            `scheduled` is published-but-not-open-yet: folding either into reserved or open would put a
+            claim button on a page that reverts. `unknown` is a campaign this host only ever saw a
+            Claimed log for – see `partial`.
+        facts:
+          type: object
+          description: |
+            Contract facts. Every amount is a decimal string in base units. A field is `null` when this
+            host has not READ it, never a zero standing in for one: on a `partial` row `total`,
+            `remaining`, `feeWei` and `publishBy` are all null, because the CampaignReserved log that
+            carries them is below this host's start block.
+          properties:
+            total: { oneOf: [{ type: "null" }, { type: string }], description: "escrowed at reserve()" }
+            claimed: { type: string, description: "recomputed in BigInt from the indexed Claimed logs, never incremented" }
+            remaining: { oneOf: [{ type: "null" }, { type: string }], description: "0 once swept – the unclaimed remainder is burned (§A5.3) or, on a cancellation, back with the owner" }
+            claimCount: { type: integer }
+            feeWei: { oneOf: [{ type: "null" }, { type: string }] }
+            root: { oneOf: [{ type: "null" }, { type: string }] }
+            snapshotBlock: { oneOf: [{ type: "null" }, { type: integer }] }
+            snapshotHash: { oneOf: [{ type: "null" }, { type: string }], description: "emitted by publish(), never stored on chain – this row is the only place it is written down" }
+            listHash: { oneOf: [{ type: "null" }, { type: string }] }
+            uri: { oneOf: [{ type: "null" }, { type: string }] }
+            start: { oneOf: [{ type: "null" }, { type: integer }] }
+            end: { oneOf: [{ type: "null" }, { type: integer }] }
+            publishBy: { oneOf: [{ type: "null" }, { type: integer }] }
+            swept: { type: boolean }
+            cancelled: { type: boolean }
+            sweptAmount: { oneOf: [{ type: "null" }, { type: string }] }
+            burned: { type: boolean, description: "false on a swept campaign means the token had no working burn() and the remainder went to 0x…dEaD" }
+            reservedBlock: { oneOf: [{ type: "null" }, { type: integer }] }
+            publishedBlock: { oneOf: [{ type: "null" }, { type: integer }] }
+        list:
+          type: object
+          description: "what THIS host holds of the list. 0 recipients is legal – the campaign is still claimable from the published bytes."
+          properties:
+            recipients: { type: integer }
+            leafCount: { oneOf: [{ type: "null" }, { type: integer }] }
+            treeHeld: { type: boolean }
+            treeListHash: { oneOf: [{ type: "null" }, { type: string }] }
+            listHashMatches: { oneOf: [{ type: "null" }, { type: boolean }], description: "does the tree this host holds hash to the list hash the chain published" }
+            cid: { oneOf: [{ type: "null" }, { type: string }] }
+        spec:
+          description: "the RULE the list was built from – groups, thresholds, shares, split and the snapshot it was frozen at – or null. Never mixed into facts."
+          oneOf: [{ type: "null" }, { type: object }]
+        partial:
+          type: boolean
+          description: "true = this row was built from a later event and the reserve was never read. Said out loud rather than shown as a campaign with a zero budget."
+    AirdropAllocation:
+      type: object
+      description: "\"In your allocation\": the amount and the proof, served against the root the CHAIN published."
+      properties:
+        campaign: { type: integer }
+        token: { oneOf: [{ type: "null" }, { type: string }] }
+        phase: { type: string }
+        account: { type: string }
+        index: { type: integer, description: "the leaf's own index = the row's position in the canonical list" }
+        quoteAmount: { type: string, description: "always \"0\" in an airdrop – the shared leaf carries two assets and the file and the leaves must agree byte for byte" }
+        amount: { type: string }
+        proof: { type: array, items: { type: string } }
+        leafTypes: { type: array, items: { type: string } }
+        root: { type: string }
+        listHash: { oneOf: [{ type: "null" }, { type: string }] }
+        start: { oneOf: [{ type: "null" }, { type: integer }] }
+        end: { oneOf: [{ type: "null" }, { type: integer }] }
+        group: { oneOf: [{ type: "null" }, { type: string }], description: "which recipient group put this wallet on the list, when the list was built here" }
+        reason: { oneOf: [{ type: "null" }, { type: string }] }
+        claimedSeen: { type: boolean, description: "what this host has SEEN. The contract's bitmap is the truth; a claim in the current block is not indexed yet." }
+        claim:
+          oneOf:
+            - type: "null"
+            - type: object
+              properties:
+                amount: { type: string }
+                ts: { oneOf: [{ type: "null" }, { type: integer }] }
+                block: { oneOf: [{ type: "null" }, { type: integer }] }
+                tx: { oneOf: [{ type: "null" }, { type: string }] }
+    # --- BEGIN fee split (backend/src/feeSplit.js) ---------------------------
+    FeeSplit:
+      type: object
+      description: |
+        The ENFORCED fee split of one launch, or `null`.
+
+        `null` is the answer for every launch created before the generation-3 factories, and it
+        is not a gap: those harvesters have no such argument, they are immutable, and nothing
+        about them will ever change. A row of zeros in their place would read as a question that
+        was asked and answered. A generation-3 launch whose creator chose nothing DOES answer
+        zeros, because there the zero is the answer.
+
+        ONE DENOMINATOR: `quoteSide` is bps of the WHOLE quote side of a harvest – the same
+        denominator `platformShareBps` has always used – and `treasuryBps` is the remainder,
+        computed last, exactly as the contract computes it. `creatorSide` re-expresses the same
+        numbers against the creator's own part; it is a second rendering, never a second source
+        of truth. `tokenSide` is a DIFFERENT denominator: the token side of every harvest is
+        burned, and `tokenSide.holdersBps` is 0 on every launch there has ever been.
+
+        `holdersVault` and `buyback` are deployed by the platform inside the create
+        transaction. There is no calldata field, on any path, through which a creator can name
+        either address – which is what "enforced" means here.
+      properties:
+        enforced: { type: boolean, description: "always true when this object is present" }
+        quoteSymbol:
+          oneOf: [{ type: "null" }, { type: string }]
+          description: "the asset the quote side is denominated in; null = the chain's native coin"
+        quoteSide:
+          type: object
+          description: "bps of the whole quote side; the four sum to 10000"
+          properties:
+            platformBps: { type: integer }
+            treasuryBps: { type: integer, description: "the remainder, computed last" }
+            holdersBps: { type: integer }
+            buybackBps: { type: integer, description: "0 on every chain in this generation – no chain has a swap router yet" }
+            platformPct: { type: number }
+            treasuryPct: { type: number }
+            holdersPct: { type: number }
+            buybackPct: { type: number }
+        creatorSide:
+          description: "the same three shares as bps of the creator's own part (10000 - platformBps), or null when the platform takes all of it"
+          oneOf:
+            - type: "null"
+            - type: object
+              properties:
+                treasuryBps: { type: integer }
+                holdersBps: { type: integer }
+                buybackBps: { type: integer }
+        tokenSide:
+          type: object
+          description: "the TOKEN side of a harvest, a different pie: burned unless holdersBps is non-zero"
+          properties:
+            holdersBps: { type: integer }
+            burnBps: { type: integer }
+        holdersVault:
+          oneOf: [{ type: "null" }, { type: string }]
+          description: "the launch's OpenHoldersVault; null when the split routes nothing to holders (no vault is deployed at all)"
+        buyback: { oneOf: [{ type: "null" }, { type: string }] }
+        harvester: { oneOf: [{ type: "null" }, { type: string }] }
+        registry:
+          oneOf: [{ type: "null" }, { type: string }]
+          description: "the chain's RewardsRootRegistry; null = epoch roots are not indexed on this host, so accrued is shown and claims cannot be proved"
+        setAtBlock: { oneOf: [{ type: "null" }, { type: integer }] }
+    VaultEpoch:
+      type: object
+      description: |
+        One sealed window of a launch's holders vault. Epochs tile the chain with no gap and no
+        overlap, which is what makes the time-weighted balances over them add up to the whole
+        history.
+      properties:
+        epoch: { type: integer }
+        vault: { type: string }
+        token: { oneOf: [{ type: "null" }, { type: string }] }
+        sealed:
+          type: boolean
+          description: "false = this host never saw the seal (a start block above it, a pruned range). The amounts are then \"0\" because they are UNKNOWN, not because the epoch was empty."
+        window:
+          oneOf:
+            - type: "null"
+            - type: object
+              properties:
+                fromBlock: { type: integer }
+                toBlock: { type: integer, description: "exclusive" }
+                sealedAt: { type: integer }
+        accrued:
+          type: object
+          properties: { quoteWei: { type: string }, tokenWei: { type: string } }
+        claimed:
+          type: object
+          properties: { quoteWei: { type: string }, tokenWei: { type: string }, count: { type: integer } }
+        remaining:
+          oneOf:
+            - type: "null"
+            - type: object
+              properties: { quoteWei: { type: string }, tokenWei: { type: string } }
+        root:
+          type: object
+          description: |
+            `state` mirrors `RewardsRootRegistry.activeRoot`: the newest version, not vetoed,
+            whose `eta` has passed. `pending` = published and still inside its 24 h delay;
+            `vetoed` = the guardian cancelled it and no replacement has been published;
+            `none` = no root yet.
+          properties:
+            state: { type: string, enum: [none, pending, active, vetoed] }
+            root: { oneOf: [{ type: "null" }, { type: string }] }
+            version: { oneOf: [{ type: "null" }, { type: integer }] }
+            rulesHash: { oneOf: [{ type: "null" }, { type: string }], description: "the pinned eligibility rule and exclusion set, so a dispute is decidable" }
+            cid: { oneOf: [{ type: "null" }, { type: string }], description: "where the leaves file is published – a hash with no bytes behind it is theatre" }
+            eta: { oneOf: [{ type: "null" }, { type: integer }] }
+            vetoed: { type: boolean }
+            history:
+              type: array
+              description: "every version this epoch has had, newest first – a veto is history, not a deletion"
+              items: { type: object }
+        rolledOver: { type: boolean }
+        rollover:
+          description: "the remainder folded back into the uncommitted pot – it does NOT leave the contract"
+          oneOf:
+            - type: "null"
+            - type: object
+              properties:
+                quoteWei: { type: string }
+                tokenWei: { type: string }
+                timedOut: { type: boolean, description: "true = nobody ever published a root for it; false = a root paid and these leaves went unclaimed" }
+                block: { type: integer }
+        concentration:
+          description: "only with ?concentration=1 – the top-1 and top-10 share of this epoch's eligible weight, from the published leaves. `note` says why a figure is null rather than substituting an estimate."
+          type: object
+          properties:
+            top1Bps: { oneOf: [{ type: "null" }, { type: integer }] }
+            top10Bps: { oneOf: [{ type: "null" }, { type: integer }] }
+            leafCount: { oneOf: [{ type: "null" }, { type: integer }] }
+            leg: { type: string, enum: [quote, token] }
+            note: { oneOf: [{ type: "null" }, { type: string }] }
+    ClaimableEpoch:
+      type: object
+      description: |
+        One epoch a wallet can claim RIGHT NOW, with everything the transaction needs.
+
+        Offered only when: the epoch is sealed and not rolled over; its newest root version is
+        un-vetoed and past its `eta`; this host holds the leaves for that root; the stored tree's
+        scope is that epoch (an airdrop list and a vault epoch with byte-identical rows produce
+        the SAME root, so the scope is checked rather than assumed); and the wallet has no
+        indexed `Claimed` for it. That last clause can only be BEHIND the chain, never ahead, so
+        the failure mode is a claim that reverts as already-claimed rather than one hidden from
+        somebody entitled to it.
+      properties:
+        token: { oneOf: [{ type: "null" }, { type: string }] }
+        vault: { type: string }
+        epoch: { type: integer }
+        claimable:
+          type: object
+          properties: { quoteWei: { type: string }, tokenWei: { type: string } }
+        window: { type: object }
+        root: { type: object }
+        claim:
+          type: object
+          description: "the vault call, in its own argument order, so a claim page never reassembles a leaf from two responses"
+          properties:
+            contract: { type: string }
+            function: { type: string, example: "claim(uint256,uint256,address,uint256,uint256,bytes32[])" }
+            args:
+              type: array
+              description: "[epoch, index, account, quoteAmount, tokenAmount, proof[]]"
+              items: {}
+        leafTypes: { type: array, items: { type: string } }
+    HarvestPayout:
+      type: object
+      description: |
+        One harvest, AS PAID. On the native path a referrer that refuses ETH has its cut folded
+        into the platform's, so these are the contract's own reported amounts and never a bps
+        calculation – a figure rebuilt from the split would overstate the payouts of every
+        referred native launch. `harvest()` is permissionless: `caller` is whoever paid the gas,
+        and nobody is obliged to call it.
+      properties:
+        block: { type: integer }
+        ts: { oneOf: [{ type: "null" }, { type: integer }] }
+        tx: { type: string }
+        caller: { oneOf: [{ type: "null" }, { type: string }] }
+        quoteWei: { type: string, description: "the whole quote side collected" }
+        tokenBurnedWei: { type: string }
+        paid:
+          type: object
+          properties:
+            platformWei: { type: string }
+            referrerWei: { type: string }
+            treasuryWei: { type: string }
+            holdersQuoteWei: { type: string }
+            buybackWei: { type: string }
+            holdersTokenWei: { type: string }
+    # --- END fee split -------------------------------------------------------
 paths:
   /networks:
     get:
@@ -554,7 +919,54 @@ paths:
         `contracts.crowdFactory` and `features.crowdLaunch` mirror each other the same way:
         with them set, raises can be CREATED here (POST /launches/quote with mode=crowd).
         Existing raises are indexed and served either way – the flag governs creation and
-        the storefront, not the data.
+        the storefront, not the data. `contracts.crowdFactories` is a DIFFERENT question and
+        answers it with a list: every CrowdFactory generation this host indexes, oldest
+        first, which since the second generation shipped (2026-09-20, the vesting floor) is
+        what "is this raise one of ours" has to be checked against. `contracts.crowdFactory`
+        is the last of them on a host whose storefront is on, and null on a host that indexes
+        raises without offering new ones.
+        `contracts.holdersVaultDeployer` and `contracts.harvesterDeployerV2` are the two CREATE
+        helpers of the fee-split generation (`features.feeSplit`): they emit nothing and index
+        nothing, and are published for the same reason `launchDeployer` and `simpleTokenDeployer`
+        are – a deployment is the whole broadcast, and these are the addresses a launch's vault
+        and harvester are actually created BY, so they are what an address prediction is taken
+        against. Null on a host that has not been told about them; unlike `rewardsRegistry` they
+        gate nothing, so an address here promises only that this host knows it.
+
+        GENERATIONS (option B). Generation 3 – the enforced fee split – is deployed BESIDE
+        generation 2, and the legacy fields keep their generation-2 meaning for as long as
+        pinned SDK bundles (immutable, served forever) and third-party integrators encode
+        against them:
+        - `contracts.launchFactory` – PINNED MEANING: the factory that accepts the generation-2
+          entry points, no FeeSplit – createLaunch(p, referrer, cid) and
+          createDirectListing(p, cid). It stays generation 2 for legacy readers; it is never
+          repointed at generation 3. Likewise `contracts.crowdFactory` (createCrowdLaunch(p,
+          referrer, cid)) and `contracts.zap` (the generation-2 OpenZap).
+        - `contracts.launchFactoryG3` – the generation-3 LaunchFactory: createLaunch(p, s,
+          referrer, cid) and createDirectListing(p, s, cid), `s` a FeeSplit (FeeSplitInput).
+          `contracts.crowdFactoryG3` – the generation-3 CrowdFactory (indexed; in
+          `crowdFactories`). `contracts.rewardsRegistry` – the chain's RewardsRootRegistry.
+          Each null where this host has none.
+        - `contracts.zapG3` – the generation-3 OpenZap, the only zap that routes a launch
+          created by `launchFactoryG3` (an OpenZap reverts UnknownLaunch for any other
+          factory's launch). Null where absent – always on Arc and Stable, whose lineage has no
+          OpenZap – and gated like `zap` (a deployed zap this host cannot price is null).
+        - `features.feeSplit` – generation 3 is configured and indexed here.
+          `features.holdersRewards` – a RewardsRootRegistry exists, so epochs can be rooted and
+          claims proved. `features.holdersPublisher` – a NON-DRY epoch publisher whose key the
+          registry accepts, beside the ERC-20 Transfer index, is configured on this host: the
+          registry AND the Transfer index AND a PUBLISHER_KEY whose address equals
+          RewardsRootRegistry.publisher() (a chain read cached for 10 minutes – false until it
+          has been read, and false once it has been unreadable for an hour) AND PUBLISHER_DRY
+          off. The design's precondition for OFFERING a holders' share at all (FEE_SPLIT_DESIGN
+          §D10); POST /launches/quote refuses holdersBps / tokenHoldersBps without it
+          (HOLDERS_UNAVAILABLE, whose message says which condition failed). It says the
+          publisher is able to publish, not that it is running at this moment (publishing is
+          an operator command).
+        - `features.storefrontG3` – first-party clients (the openfair site, REST prepare, SDK
+          >= 1.4.0) should CREATE on generation 3: contracts.launchFactoryG3, with a FeeSplit.
+          Per host (env STOREFRONT_G3), default false, never true without a generation-3
+          factory. It moves no legacy field.
       responses:
         "200": { description: OK }
         "304": { description: Not modified }
@@ -592,6 +1004,11 @@ paths:
         while `quoteIn` and `payWith=quote` encode plain OpenLaunch calls and answer
         on every chain. A frozen quote asset is a 400 `QUOTE_FROZEN`, read live from the
         launch rather than from the index.
+        The zap is chosen by the launch's FACTORY: a generation-2 launch is routed through
+        `contracts.zap`, a generation-3 one (created by `contracts.launchFactoryG3`) through
+        `contracts.zapG3` – each OpenZap accepts only its own factory's launches. The ETH route
+        of a generation-3 launch answers the same 404 `ZAP_NOT_ENABLED` where `zapG3` is null
+        (Arc, Stable), and the token record's `zap` field says in advance which one applies.
       parameters:
         - { name: launch, in: query, required: true, schema: { type: string }, description: "launch address or its token address (`token` is accepted as an alias)" }
         - { name: ethIn, in: query, schema: { type: string }, description: "buy, paying this much ETH (wei)" }
@@ -644,6 +1061,149 @@ paths:
       responses:
         "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Token" } } } }
         "404": { description: not indexed }
+  # --- BEGIN fee split (backend/src/feeSplit.js) ---------------------------
+  # Every route here is a READ. Nothing in this API opens an epoch, publishes a
+  # root or claims anything: `openEpoch` and `rollover` are permissionless calls
+  # anybody's wallet can send, `publishRoot` is the publisher's own key, and
+  # `claim` is signed by the recipient against the vault.
+  #
+  # The token responses above gain two fields on every generation-3 launch:
+  # `feeSplit` (FeeSplit, null for every earlier generation – ABSENT, not zero)
+  # and `rewards` (a compact summary of the epochs below, null when the launch
+  # routes nothing to holders). GET /api/tokens/{address} – the token page's own
+  # endpoint, outside /v1 – additionally carries `poolFees`.
+  /rewards/mine:
+    get:
+      tags: [public]
+      summary: Every epoch a wallet can claim right now, across every launch, with proofs
+      description: |
+        The claim page's one call. Never cached in a shared cache: the answer is about one
+        wallet.
+
+        The scan is BOUNDED rather than exhaustive, and bounded TWICE, because each candidate
+        epoch can cost a full Merkle dump read off disk on the event loop the indexer shares:
+        at most 200 candidate rows are looked at and at most 8 published lists are actually
+        read. `scanned` says how many rows were looked at, `treesRead` how many lists were read,
+        and `truncated` says whether either bound was reached – narrow with `token=` when it
+        was. `rootsIndexed: false` means this host has no RewardsRootRegistry configured, so
+        nothing here can be proved whatever has accrued.
+
+        `claimed` is this wallet's own indexed history – the answer to "did it land".
+      parameters:
+        - { name: account, in: query, required: true, schema: { type: string } }
+        - { name: token, in: query, schema: { type: string }, description: "narrow to one launch" }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 100 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  account: { type: string }
+                  items: { type: array, items: { $ref: "#/components/schemas/ClaimableEpoch" } }
+                  total: { type: integer }
+                  claimed: { type: array, items: { type: object } }
+                  rootsIndexed: { type: boolean }
+                  scanned: { type: integer }
+                  treesRead: { type: integer, description: "published lists read off disk for this answer (at most 8)" }
+                  truncated: { type: boolean }
+        "400": { description: "BAD_INPUT – account must be a 0x-prefixed 20-byte address" }
+        "404": { description: "FEE_SPLIT_OFF – no generation-3 factory is configured on this host" }
+        "429": { description: RATE_LIMITED (60/min) }
+  /rewards/publisher:
+    get:
+      tags: [public]
+      summary: Who may publish a root on this chain, and every rotation this host has seen
+      description: |
+        The publisher is a real trusted role and this endpoint exists to say so plainly: it
+        decides WHO gets an epoch's value, never HOW MUCH an epoch holds – the vault seals the
+        amount and cannot be told to pay more. A guardian may veto a root before it activates
+        and delay a rotation; it can neither publish nor touch funds.
+
+        `publisher: null` means this host has seen no rotation, so the seat is still the one set
+        at the registry's construction. It is deliberately not read over RPC, because a view that
+        answered from the chain would disagree with the rotation log the moment the RPC was down.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  registry: { type: string }
+                  publisher: { oneOf: [{ type: "null" }, { type: string }] }
+                  rotatedAtBlock: { oneOf: [{ type: "null" }, { type: integer }] }
+                  rotations: { type: integer }
+        "404": { description: "FEE_SPLIT_OFF, or NO_REGISTRY – no RewardsRootRegistry on this host" }
+  /tokens/{address}/rewards:
+    get:
+      tags: [public]
+      summary: One launch's holders pot – the enforced split, then every sealed epoch
+      description: |
+        `feeSplit` travels with the amounts on purpose: a surface that renders an amount has to
+        render the rule beside it, and must not need two calls to do it.
+
+        A launch that routes nothing to holders answers `vault: null` and an empty list rather
+        than a 404 – "this launch pays no holders share" is an answer.
+
+        `concentration=1` adds each epoch's top-1 and top-10 share of eligible weight, computed
+        from the published leaves this host holds. It is off by default because it reads those
+        leaves per epoch. At most 8 lists are read per request – a root is immutable, so an
+        answer already computed costs nothing and does not count, and past the cap the figure
+        is null with a `note` naming `?limit=` rather than an estimate.
+      parameters:
+        - { name: address, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 24, maximum: 100 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+        - { name: concentration, in: query, schema: { type: boolean, default: false } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feeSplit: { $ref: "#/components/schemas/FeeSplit" }
+                  token: { type: string }
+                  vault: { oneOf: [{ type: "null" }, { type: string }] }
+                  registry: { oneOf: [{ type: "null" }, { type: string }] }
+                  rootsIndexed: { type: boolean }
+                  total: { type: integer }
+                  accrued: { type: object, properties: { quoteWei: { type: string }, tokenWei: { type: string } } }
+                  claimed: { type: object, properties: { quoteWei: { type: string }, tokenWei: { type: string } } }
+                  epochs: { type: array, items: { $ref: "#/components/schemas/VaultEpoch" } }
+        "404": { description: "token is not indexed, or FEE_SPLIT_OFF" }
+        "429": { description: RATE_LIMITED (60/min) }
+  /tokens/{address}/pool-fees:
+    get:
+      tags: [public]
+      summary: What the pool actually paid, per harvest
+      parameters:
+        - { name: address, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 100 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/HarvestPayout" } }
+                  harvests: { type: integer }
+                  lifetime:
+                    type: object
+                    properties:
+                      quoteWei: { type: string }
+                      holdersQuoteWei: { type: string }
+                      tokenBurnedWei: { type: string }
+                      holdersTokenWei: { type: string }
+        "404": { description: "token is not indexed, or FEE_SPLIT_OFF" }
+  # --- END fee split ---------------------------------------------------------
   # ORDER IS LOAD-BEARING in the implementation: /crowd/terms is registered before
   # /crowd/{token}, or every terms request would be matched as a raise called "terms".
   /crowd/terms:
@@ -792,6 +1352,522 @@ paths:
                         contract: { type: [string, "null"], description: "the contract that holds it" }
                   note: { type: string }
         "404": { description: not indexed }
+  # ---- holder snapshots (airdrop board) ------------------------------------
+  /snapshots:
+    post:
+      tags: [compute]
+      summary: Queue a holder snapshot of an ERC-20 or an NFT collection
+      description: |
+        The recipient list behind the board's two holder groups. It is a QUEUED JOB and never an
+        inline answer: 50 holders a page means 5,000 holders is ~100 explorer requests and 200,000
+        is ~4,000 – about a tenth of one backend's daily share of the explorer key pool, spent in a
+        single click. One worker drains the queue at the explorer client's own pace.
+
+        `minValue` is MANDATORY and must be above zero – the minimum balance, or the minimum number
+        of items for a collection. It is simultaneously the sybil floor and the thing that makes the
+        query affordable: rows arrive sorted by balance descending, so "at or above X" is "page
+        until the first row below X, then stop".
+
+        Rows the explorer flags `is_scam` are never included; `is_contract` rows are excluded unless
+        `includeContracts` is set (a DAO treasury is a contract). The launch's own system addresses
+        – bonding curve, pool, team vesting, creator, LP safe, factory – plus the zero and burn
+        addresses are excluded always and cannot be added back.
+
+        An ERC-1155 collection is deduped per address: the endpoint answers one row per
+        (holder, token_id) pair, so `holdersCount` counts pairs and `listCount` counts people.
+
+        The job FAILS CLOSED, and "complete" is not the same as "found something". A walk that could
+        not finish – the explorer went away, the page budget ran out, the token's type did not match
+        the rows – publishes nothing at all (`INCOMPLETE`, `TYPE_MISMATCH`, `EXPLORER_UNREACHABLE`),
+        and neither does a walk that finished with nothing in it. An instance whose own indexer is
+        behind answers the valid shape `{"items": [], "next_page_params": null}`; that is
+        `EXPLORER_EMPTY`, not a holder list. `RECONCILE` is the softer version – a complete walk of a
+        one-row-per-holder token that answered far fewer rows than the explorer's own
+        `holdersCount` – and `EMPTY_LIST` is a walk whose every row was excluded or below the floor.
+
+        Off on chains that are not Blockscout-backed (Stable 988): 404 `SNAPSHOT_OFF`.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, address, minValue, requestedBy]
+              properties:
+                kind: { type: string, enum: [erc20, nft] }
+                address: { type: string, description: "the token or collection, full 0x address" }
+                minValue: { type: string, description: "minimum balance in the token's smallest unit, or minimum items held – mandatory, above 0" }
+                requestedBy: { type: string, description: "the wallet asking; a claim, not an identity – it carries the per-wallet rate limit" }
+                includeContracts: { type: boolean, default: false, description: "keep rows the explorer flags is_contract (is_scam is never kept)" }
+      responses:
+        "200": { description: "queued – poll GET /snapshots/{id}" }
+        "400": { description: "BAD_INPUT – kind, address, minValue or requestedBy" }
+        "404": { description: "SNAPSHOT_OFF – this chain is not Blockscout-backed, or this host holds no explorer key" }
+        "429": { description: "SNAPSHOT_RATE_LIMITED (per wallet) or SNAPSHOT_QUEUE_FULL (per chain)" }
+  /snapshots/{id}:
+    get:
+      tags: [compute]
+      summary: One snapshot job – its status, its block, its hashes
+      description: |
+        `status` is queued | running | done | failed | held. `held` means the cross-check against
+        this host's own `Transfer` index disagreed with the explorer beyond tolerance, so nothing
+        may be published from it; `crossCheck` says what was compared, or why nothing was (a host
+        with no local index, a token whose index starts after its creation block, an index behind
+        the snapshot window – each said in words rather than silently skipped).
+
+        `block` and `blockHash` are read together, from one call, immediately before the holders:
+        our chains are not archive chains and the explorer's holder list takes no block parameter,
+        so the snapshot is taken at head and pinned by its block hash. It is reproducible by
+        replaying Transfer logs – never by asking a pruned RPC for balances at a past block, and no
+        surface may say otherwise.
+
+        `blockEnd` is the head read again when the walk FINISHED, and `blockDrift` is the width
+        between the two. It is not decoration: the walk is up to `MAX_PAGES` paced explorer
+        requests, which on a 0.1 s chain is thousands of blocks, so page 1 and the last page are
+        balances at different blocks and the list is read across a window rather than at one block.
+        `note` says which of the two this job produced, and a width above the configured bound fails
+        the job (`HEAD_DRIFT`) instead of publishing a list whose rows are minutes apart.
+
+        `rowsSeen` and `dropped` are what the walk actually read and what the filters removed, so
+        `listCount` can be reconciled against the explorer's `holdersCount` by a reader and not only
+        by this server.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: OK }
+        "404": { description: "unknown job, or SNAPSHOT_OFF on this chain" }
+  /snapshots/{id}/list:
+    get:
+      tags: [compute]
+      summary: The canonical holder list, with the hash of the bytes as served
+      description: |
+        Lower-case addresses, sorted ascending, one newline-terminated row each, in the form
+        `address,quoteAmount,tokenAmount`. `quoteAmount` is always `0` in an airdrop snapshot – the
+        column exists because the shared Merkle leaf carries two assets, so the file and the leaves
+        agree byte for byte, and a leaf's index is its row's position in this file.
+
+        `servedHash` is recomputed from what is served on every request and stands beside the
+        `listHash` stored when the job finished, so a reader can redo the hash over the bytes in
+        their hand. A hash with no bytes behind it is theatre.
+
+        A job that is not `done` has no bytes at all: 409 `SNAPSHOT_NOT_READY`.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: OK }
+        "404": { description: "unknown job, or SNAPSHOT_OFF on this chain" }
+        "409": { description: "SNAPSHOT_NOT_READY – queued, running, failed or held" }
+  # ---- merkle proof service (airdrop campaigns, fee-split epochs) -----------
+  /merkle/{root}:
+    get:
+      tags: [public]
+      summary: One published Merkle tree – its scope, its size, its totals, its list hash
+      description: |
+        The proof service this app has never had. Two features pay a list of wallets from one leaf
+        shape: an airdrop campaign (`scopeKind: airdrop`, `scope` = the on-chain campaign id) and
+        the fee-split holders vault (`scopeKind: epoch`, `scope` = the epoch). A crowd raise's
+        allowlist can adopt the same routes – its root is pasted by hand today.
+
+        The leaf is an OpenZeppelin `StandardMerkleTree` leaf over
+        `['uint256','uint256','address','uint256','uint256']` carrying
+        `(scope, index, account, quoteAmount, tokenAmount)`, which in Solidity is
+
+            keccak256(bytes.concat(keccak256(abi.encode(scope, index, account, quoteAmount, tokenAmount))))
+
+        with sibling pairs hashed sorted, exactly as OpenZeppelin's `MerkleProof.verify` does.
+        `abi.encode`, never `abi.encodePacked`. `index` is the row's position in the canonical list
+        below, which is what a claimed-bitmap indexes. An airdrop always builds with
+        `quoteAmount = 0` and its distributor passes the literal `0`, so a leaf carrying a quote leg
+        is unprovable there; the fee-split vault is a two-asset pot and uses both legs.
+
+        `scopeKind` is NOT part of the leaf: campaign 5 and epoch 5 over a byte-identical list have
+        the SAME root. The two are separated by being two contracts each storing its own root.
+
+        A tree is immutable by its root – the root is the hash of its contents – so every answer
+        here is `Cache-Control: immutable`.
+
+        Trees are published by an operator, not by a request: building one is a synchronous pass
+        over up to 250,000 rows and it happens once per campaign or epoch. An airdrop campaign's
+        tree comes from `backend/scripts/merkle-tree.mjs` (`build --write`, then `verify`); a
+        fee-split epoch's comes from `backend/scripts/publish-epoch.mjs`, which weights every
+        holder over the epoch's own block window, stores the tree here and only then sends
+        `publishRoot` – so the list is already servable when the on-chain event appears, which is
+        what the registry's 24 h ROOT_DELAY is a warning window for. The URL of this route is the
+        `cid` that event carries. A host that has published none answers 404 here, which is the
+        honest answer and not an outage.
+
+        Rate-limited, 120/min per IP: the read is cheap but it is synchronous, and the process is
+        single-threaded.
+      parameters: [{ name: root, in: path, required: true, schema: { type: string, pattern: "^0x[0-9a-fA-F]{64}$" } }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  root: { type: string }
+                  scopeKind: { type: string, enum: [airdrop, epoch] }
+                  scope: { type: string, description: "uint256 as a decimal string – campaign id or epoch" }
+                  listHash: { type: string, description: "keccak256 of the canonical list bytes" }
+                  leafCount: { type: integer }
+                  totalQuoteWei: { type: string, description: "base units; '0' for every airdrop list" }
+                  totalTokenWei: { type: string, description: base units }
+                  leafTypes: { type: array, items: { type: string } }
+                  createdAt: { type: [string, "null"], format: date-time }
+        "400": { description: "BAD_INPUT – root must be 0x + 64 hex" }
+        "404": { description: unknown merkle root }
+  /merkle/{root}/proof/{account}:
+    get:
+      tags: [public]
+      summary: One wallet's proof against one root (rate-limited, 60/min per IP)
+      description: |
+        Everything a claim call needs and nothing it has to fetch twice: the leaf's own `index`,
+        both amount legs, the `scope` word and the proof itself. Feed them back in the leaf's own
+        order to the distributor's `claim`.
+
+        A wallet that is not in the list and a root that does not exist answer the SAME 404, with
+        the same message. That is deliberate: they are the same answer to a claimer, and telling
+        them apart only helps somebody enumerating a list they cannot claim from.
+      parameters:
+        - { name: root, in: path, required: true, schema: { type: string, pattern: "^0x[0-9a-fA-F]{64}$" } }
+        - { name: account, in: path, required: true, schema: { type: string, pattern: "^0x[0-9a-fA-F]{40}$" } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  root: { type: string }
+                  scopeKind: { type: string, enum: [airdrop, epoch] }
+                  scope: { type: string }
+                  index: { type: integer, description: "position in the canonical list – the claimed-bitmap index" }
+                  account: { type: string, description: checksummed }
+                  quoteAmount: { type: string, description: "base units; '0' in every airdrop leaf" }
+                  tokenAmount: { type: string, description: base units }
+                  proof: { type: array, items: { type: string, description: "0x + 64 hex" } }
+                  leafTypes: { type: array, items: { type: string } }
+        "400": { description: "BAD_INPUT – malformed root or account" }
+        "404": { description: "no proof for this root and account (unknown root, or not in the list)" }
+        "429": { description: RATE_LIMITED }
+  /merkle/{root}/list:
+    get:
+      tags: [public]
+      summary: The canonical recipient list of a root, as bytes (text/plain)
+      description: |
+        Lower-case addresses, sorted ascending, one newline-terminated row each, in the form
+        `address,quoteAmount,tokenAmount`; amounts are plain decimal base units with no leading
+        zeros, so each number has exactly one spelling and the file has exactly one hash. A leaf's
+        `index` is its row's position here.
+
+        `X-List-Hash` is recomputed from what is served on every request – the `servedHash` beside
+        the published `listHash` – and `X-Merkle-Root` names the tree. With this file and the
+        library, a recipient rebuilds the root themselves and checks that the amount they are being
+        offered is the amount in the tree, trusting this server for none of it. A hash with no bytes
+        behind it is theatre.
+
+        Rate-limited, 10/min per IP – the tightest of the three. Every cache miss parses the stored
+        dump and builds the whole file as one string in the response body, which is megabytes on a
+        six-figure list, and a recipient downloads it once.
+      parameters: [{ name: root, in: path, required: true, schema: { type: string, pattern: "^0x[0-9a-fA-F]{64}$" } }]
+      responses:
+        "200":
+          description: OK
+          content:
+            text/plain:
+              schema: { type: string }
+        "400": { description: "BAD_INPUT – root must be 0x + 64 hex" }
+        "404": { description: unknown merkle root }
+  # ---- allocation board (airdrop campaigns + the build pipeline) ------------
+  # OFF UNLESS A DISTRIBUTOR IS CONFIGURED. Every route below answers 404
+  # `AIRDROP_OFF` on a chain with no OpenAirdrop singleton in its env – the
+  # switch is an address, not a flag – and on Stable 988, where the board is off
+  # entirely in v1 and a pasted distributor address is refused rather than
+  # honoured. A client gates on that one code; there is no partial mode.
+  # GET /config's `features.airdrop` and `contracts.airdrop` say the same thing
+  # ahead of time, from the same predicate.
+  /airdrops:
+    get:
+      tags: [public]
+      summary: Allocation campaigns of a token, or the newest across the chain
+      description: |
+        The campaigns this host has INDEXED, which is not the same as the campaigns this host
+        created: `reserve()` is permissionless, so the list is whatever the chain contains. A row
+        whose reserve sits below this host's start block still counts its claims and says
+        `partial: true` – see the AirdropCampaign schema.
+      parameters:
+        - { name: token, in: query, schema: { type: string }, description: "full 0x address; omitted lists the chain's newest campaigns" }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/AirdropCampaign" } }
+                  total: { type: integer }
+        "400": { description: "BAD_INPUT – token must be a 0x-prefixed 20-byte address" }
+        "404": { description: "AIRDROP_OFF – no OpenAirdrop distributor configured on this chain" }
+  /airdrops/mine:
+    get:
+      tags: [public]
+      summary: Every campaign a wallet is in, claimed or not
+      description: |
+        The UNION of two different facts: the address is in a list this host stored, or it has
+        CLAIMED (the chain says so, whatever this host holds). The second is why a campaign built
+        somewhere else still appears the moment the wallet claims.
+
+        Never cached in a shared cache: the answer is about one wallet.
+      parameters:
+        - { name: account, in: query, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 200 } }
+      responses:
+        "200":
+          description: "OK – each item is an AirdropCampaign plus an `allocation` (index, amount, group, reason, claim)"
+        "400": { description: "BAD_INPUT – account must be a 0x-prefixed 20-byte address" }
+        "404": { description: "AIRDROP_OFF – no OpenAirdrop distributor configured on this chain" }
+        "429": { description: RATE_LIMITED (60/min) }
+  /airdrops/{id}:
+    get:
+      tags: [public]
+      summary: One campaign – the contract facts, the snapshot, the list hash and the creator's rule
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AirdropCampaign" }
+        "404": { description: "unknown campaign (a non-numeric id is simply not one), or AIRDROP_OFF" }
+  /airdrops/{id}/list:
+    get:
+      tags: [public]
+      summary: The canonical recipient list bytes, with the hash of what was served
+      description: |
+        `address,quoteAmount,tokenAmount` – lower case, sorted by address ascending, one
+        newline-terminated row each; `quoteAmount` is always 0 in an airdrop. A leaf's index is its
+        row's position in this file.
+
+        `servedHash` is recomputed from the bytes on every request and stands beside the on-chain
+        `listHash`, so a reader can redo the hash over the bytes in their hand and a server that
+        silently edited a list cannot hide it; `matches` is that comparison, done here so no page
+        compares two strings itself. A hash with no bytes behind it is theatre.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  campaign: { type: integer }
+                  root: { type: string }
+                  snapshotBlock: { oneOf: [{ type: "null" }, { type: integer }] }
+                  snapshotHash: { oneOf: [{ type: "null" }, { type: string }] }
+                  listHash: { oneOf: [{ type: "null" }, { type: string }] }
+                  servedHash: { type: string }
+                  matches: { oneOf: [{ type: "null" }, { type: boolean }] }
+                  count: { type: integer }
+                  format: { type: string }
+                  list: { type: string }
+        "404": { description: "unknown campaign, or AIRDROP_OFF" }
+        "409": { description: "LIST_NOT_HELD – the campaign has published no list yet, or this host holds no tree for its root (a legal state: the campaign was built elsewhere)" }
+        "429": { description: RATE_LIMITED (10/min) }
+  /airdrops/{id}/allocation/{account}:
+    get:
+      tags: [public]
+      summary: "\"In your allocation\" – amount and Merkle proof, or 404"
+      description: |
+        ONE 404 for "no such campaign", "this campaign has no list" and "you are not in it": they are
+        the same answer to a claimer, and telling them apart only helps somebody enumerating a list
+        they cannot claim from. The proof is served against the root the CHAIN published, so a wallet
+        can verify it against the published bytes and never has to trust this host.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+        - { name: account, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AirdropAllocation" }
+        "400": { description: "BAD_INPUT – account must be a 0x-prefixed 20-byte address" }
+        "404": { description: "no allocation for this campaign and account, or AIRDROP_OFF" }
+        "429": { description: RATE_LIMITED (60/min) }
+  /airdrops/groups:
+    get:
+      tags: [public]
+      summary: The recipient-group cards a create flow renders
+      description: |
+        Five cards: `manual`, `curve-holders`, `erc20-holders`, `nft-holders` and `fomo`. The last is
+        `enabled: false` and carries a REASON STRING that the page is meant to print in full rather
+        than summarise as "coming soon" – there is no official fomo.family feed, and a launchpad whose
+        pitch is verifiability does not put a recipient group on a reseller's auth token.
+
+        `curve-holders` is answered from this backend's own trade index and REFUSES past graduation:
+        the pool holds the float there and `total - sold` describes nobody. The two holder cards read
+        a COMPLETED snapshot job (POST /snapshots) and their threshold is mandatory.
+      responses:
+        "200": { description: "OK – { groups[], limits: { maxGroups, maxRecipients }, fomo: { enabled: false, reason } }" }
+        "404": { description: "AIRDROP_OFF – no OpenAirdrop distributor configured on this chain" }
+  /airdrops/drafts:
+    post:
+      tags: [compute]
+      summary: Create or replace a draft – the RULE, before any money moves
+      description: |
+        A draft spends nothing and is the rule rather than the result: §D6 stores it so anybody can
+        recompute the list from the same block and get the same root. Passing `id` REPLACES a draft
+        whole – not a patch, because a spec whose halves came from two intentions describes neither –
+        and drops its frozen resolution with it.
+
+        THE ID IS THE CAPABILITY. `createdBy` is a CLAIM, not an identity: nothing here authenticates
+        a wallet and nothing here moves money – reserve, publish, claim and sweep are signed by the
+        creator's own wallet against the distributor, and this API holds no key that could sign one.
+
+        An unbuilt draft EXPIRES (7 days by default, `AIRDROP_DRAFT_TTL_MS`): a resolution is a
+        promise about a block, and one frozen six months ago no longer describes who holds what. A
+        built draft never expires – it is the only row tying a published root back to its rule.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, budget, groups]
+              properties:
+                id: { type: string, description: "replace this draft instead of creating one" }
+                token: { type: string }
+                budget: { type: string, description: "base units, a positive decimal integer – never a float" }
+                createdBy: { type: string }
+                includeCreator: { type: boolean, default: false, description: "§D10.4's one removable exclusion – a creator paying themselves out of their own campaign has to say so" }
+                split:
+                  type: object
+                  properties:
+                    mode: { type: string, enum: [equal, weighted] }
+                    capBps: { oneOf: [{ type: "null" }, { type: integer }], default: 500, description: "per-wallet cap in bps of the GROUP budget; null disables it" }
+                    sqrt: { type: boolean, description: "flatten weights by sqrt(w); weighted only" }
+                    topN: { oneOf: [{ type: "null" }, { type: integer }], description: "ties at the cut are ALL included and the count shown is the real one" }
+                groups:
+                  type: array
+                  description: "1..8 groups; with more than one, every group states its own budgetBps and they add up to exactly 10000"
+                  items:
+                    type: object
+                    properties:
+                      id: { type: string }
+                      kind: { type: string, enum: [manual, curve-holders, erc20-holders, nft-holders, fomo] }
+                      budgetBps: { type: integer }
+                      addresses: { type: array, items: { type: string }, description: "manual only; objects with a `weight` are allowed" }
+                      token: { type: string, description: "curve-holders only" }
+                      minTokens: { type: string, description: "curve-holders qualifying floor" }
+                      snapshotId: { type: string, description: "erc20-holders / nft-holders" }
+                      minValue: { type: string, description: "mandatory on a holder group, and never below the snapshot job's own" }
+                      weightBy: { type: string, enum: [items, flat], description: "nft-holders: proportional to items is an OPT-IN – a 400-item whale otherwise takes 400 shares" }
+                      split: { type: object, description: "overrides the draft split for this group" }
+      responses:
+        "200": { description: "OK – the stored rule" }
+        "400": { description: "BAD_INPUT, BAD_ADDRESS, BAD_ADDRESS_CHECKSUM, BAD_GROUP, CAP_TOO_SMALL, LIST_TOO_LARGE" }
+        "404": { description: "unknown draft (with `id`), or AIRDROP_OFF" }
+        "409": { description: "ALREADY_BUILT – a published rule does not change, create a new draft; DRAFT_EXPIRED" }
+        "429": { description: RATE_LIMITED (30/min) }
+  /airdrops/drafts/{id}:
+    get:
+      tags: [compute]
+      summary: One draft, its resolution counts and what was built from it
+      description: |
+        Limited like /preview rather than left open: this read parses the frozen candidate blob (up to
+        AIRDROP_MAX_CANDIDATES entries) synchronously, on the one event loop the API and the indexer
+        share. The candidate lists themselves are never in the answer – only counts, facts and refusals.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: "OK – the draft plus `resolution` (null until it is resolved)" }
+        "404": { description: "unknown draft, or AIRDROP_OFF" }
+        "409": { description: "DRAFT_EXPIRED – the frozen list is too old to sign; create the draft again" }
+        "429": { description: RATE_LIMITED (60/min) }
+  /airdrops/drafts/{id}/resolve:
+    post:
+      tags: [compute]
+      summary: Resolve the groups into candidates at a named block, and FREEZE the answer
+      description: |
+        The only step that reads data, and its answer is frozen into the draft: preview and build both
+        run off the stored resolution, so the list a creator looked at is the list they sign. A preview
+        that silently re-read the trade index a minute later would show a different list under the same
+        rule.
+
+        The campaign publishes ONE snapshot block: the EARLIEST of the contributing sources, with that
+        block's hash, and the window to the latest beside it. Naming the latest would claim a freshness
+        the oldest source does not have. A hash that could not be read is published as absent and said
+        out loud – a fabricated hash is not honest and a snapshot without one is.
+
+        The never-pay set (§D10.4) is applied here, over the campaign token AND every source token: the
+        curve, the pool, the team safe, the creator, the harvester, the factory, the distributor, the
+        zap, plus the zero and burn addresses. The removed addresses come back in the answer.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: "OK – counts, snapshot facts, exclusions and warnings" }
+        "400": { description: "BAD_GROUP, BAD_ADDRESS, THRESHOLD_BELOW_SNAPSHOT, TOO_MANY_CANDIDATES" }
+        "404": { description: "unknown draft, UNKNOWN_TOKEN, UNKNOWN_SNAPSHOT, or AIRDROP_OFF" }
+        "409": { description: "PAST_CURVE (the pool holds the float – use a holder snapshot), SNAPSHOT_NOT_READY, SNAPSHOT_KIND_MISMATCH, SNAPSHOT_TAMPERED, GROUP_DISABLED (fomo), ALREADY_BUILT, DRAFT_EXPIRED" }
+        "429": { description: RATE_LIMITED (10/min) }
+  /airdrops/drafts/{id}/preview:
+    get:
+      tags: [compute]
+      summary: The per-wallet allocation, the concentration figure and the warnings
+      description: |
+        Pure arithmetic over the frozen resolution: same resolution in, same bytes out – which is what
+        lets a creator compare this `listHash` with the one the build returns and see that nothing moved
+        in between.
+
+        Everything the split did not pay out is DUST and the sweep BURNS it (§A5.3): an equal split's
+        remainder, each flooring, a group that paid nobody, a row that floored to zero. It is reported
+        rather than handed to whoever sorts first. `concentration` is arithmetic about the campaign, not
+        a score about anybody, and it is published always.
+
+        Paged; the totals always describe the WHOLE list, never the page.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 200 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        "200": { description: "OK – totals, dust, listHash, per-group figures, concentration, warnings, recipients[]" }
+        "400": { description: "CAP_TOO_SMALL (a per-wallet cap that cannot pay the group out would burn the rest), LIST_TOO_LARGE, ZERO_LEAF, DUPLICATE_ADDRESS" }
+        "404": { description: "unknown draft, or AIRDROP_OFF" }
+        "409": { description: "NOT_RESOLVED – POST /resolve first; EMPTY_LIST – this rule pays nobody; STALE_RESOLUTION; DRAFT_EXPIRED" }
+        "429": { description: RATE_LIMITED (60/min) }
+  /airdrops/drafts/{id}/build:
+    post:
+      tags: [compute]
+      summary: Build the canonical list and the Merkle tree – the words publish() takes
+      description: |
+        `campaignId` is REQUIRED and it is the on-chain id returned by `reserve()`: it is baked into
+        every leaf as the proof scope, so a proof from one campaign is structurally unusable in
+        another. That is the two-moment shape of §D4 rather than an inconvenience – the escrow is in
+        place before any list is signed.
+
+        Returns `{root, listHash, snapshotBlock, snapshotHash, leafCount, total}` plus the budget, the
+        dust that will burn, the concentration figure and the warnings. The list bytes and every proof
+        are then served by GET /merkle/{root} – publish that URL as the campaign `uri`.
+
+        Idempotent on the same resolution and the same id: a root is a function of its contents.
+        Building also stores the list and the rule against the campaign, which is what makes
+        GET /airdrops/mine and the `group`/`reason` on an allocation answer anything at all.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [campaignId]
+              properties:
+                campaignId: { type: string, description: "the on-chain campaign id from reserve()" }
+      responses:
+        "200": { description: OK }
+        "400": { description: "BAD_INPUT (campaignId is the proof scope and is required), CAP_TOO_SMALL, LIST_TOO_LARGE, SUM_MISMATCH" }
+        "404": { description: "unknown draft, or AIRDROP_OFF" }
+        "409": { description: "NOT_RESOLVED, EMPTY_LIST, STALE_RESOLUTION, ALREADY_BUILT (for a different campaign), DRAFT_EXPIRED" }
+        "429": { description: RATE_LIMITED (10/min) }
   /launches:
     get: { tags: [public], summary: Alias of /tokens, responses: { "200": { description: OK } } }
   /launches/{address}/status:
@@ -814,6 +1890,29 @@ paths:
                 mode: { type: string, enum: [fair, instant, crowd] }
                 creator: { type: string }
                 referrer: { type: string }
+                generation:
+                  type: integer
+                  enum: [2, 3]
+                  description: |
+                    Which factory generation to prepare for. Omitted (and no `feeSplit`) = 2:
+                    contracts.launchFactory, exactly the call this endpoint always prepared.
+                    3 = contracts.launchFactoryG3 with a FeeSplit as the create call's second
+                    argument (the default split {0, 0, 0} when `feeSplit` is omitted).
+                    404 `FEE_SPLIT_OFF` where contracts.launchFactoryG3 is null. For mode=crowd
+                    only the generation of contracts.crowdFactory is accepted (2 on every live
+                    host).
+                feeSplit:
+                  allOf: [{ $ref: "#/components/schemas/FeeSplitInput" }]
+                  description: |
+                    fair/instant only. Present = generation 3 (contracts.launchFactoryG3,
+                    returned as `to`), even when every share is 0. Validated here by the rules
+                    the factory enforces, each with its own code, so a split the chain would
+                    refuse never reaches a wallet: BAD_SPLIT (not an integer 0-10000, an unknown
+                    field, platformShareBps + holdersBps + buybackBps > 10000, or a non-zero
+                    share under 100), BUYBACK_UNAVAILABLE (buybackBps not 0), HOLDERS_UNAVAILABLE
+                    (holdersBps or tokenHoldersBps where features.holdersPublisher is false).
+                    Refused with BAD_SPLIT for mode=crowd: a raise's split is owner-set on the
+                    CrowdFactory, never the creator's.
                 quote:
                   type: string
                   description: |
@@ -826,7 +1925,23 @@ paths:
                   required: [name, symbol]
                   properties:
                     name: { type: string, maxLength: 64 }
-                    symbol: { type: string, maxLength: 10 }
+                    symbol:
+                      type: string
+                      minLength: 1
+                      description: |
+                        Any script – Latin, Cyrillic, CJK, Arabic, emoji – at most 11
+                        characters as MetaMask counts them: 11 UTF-16 code units
+                        (JavaScript .length), so an emoji takes two or more (a cat 2, a
+                        flag 4, the ZWJ family 11) – five cat emoji fit, six do not – and
+                        at most 11 user-perceived characters as well. No whitespace,
+                        control or invisible format characters inside, at least one
+                        visible character. The ends are trimmed and it is upper-cased
+                        on-chain (a script without case is unchanged); the length is
+                        measured after that. 11 is MetaMask's symbol limit for adding a
+                        token to the wallet; ERC-20 itself has none. Refused with 400
+                        BAD_INPUT otherwise. (No maxLength: JSON Schema counts code
+                        points, not UTF-16 units, and the ends are trimmed first.)
+                      example: FAIR
                     totalSupply: { type: number }
                 fair:
                   type: object
@@ -879,16 +1994,17 @@ paths:
                     extensionMinBps: { type: integer, minimum: 5000, maximum: 10000 }
                     vestingDurationSeconds: { type: integer, description: "90-730 days" }
                     vestingIntervalSeconds: { type: integer, description: "0 = continuous; otherwise >= 30 days and it must divide the duration exactly" }
-                    teamVestingDurationSeconds: { type: integer, description: "never shorter than the author's own" }
+                    teamVestingDurationSeconds: { type: integer, description: "never shorter than the author's own, and never under 90 days (7776000) when teamTokensBps > 0 - the team safe kept its floor when the author's came down to 1 day on 2026-09-20" }
                     participantVestingSeconds: { type: integer, maximum: 15552000 }
                     poolFeeTier: { type: integer, enum: [100, 500, 3000, 10000] }
                     allowlistRoot: { type: string }
                     metadataHash: { type: string, description: "keccak256 of the metadata bytes – what the campaign page verifies against" }
       responses:
         "200": { description: quote, content: { application/json: { schema: { $ref: "#/components/schemas/Quote" } } } }
-        "400": { description: validation error, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
-        "404": { description: "CROWD_NOT_ENABLED for mode=crowd on a chain without a CrowdFactory" }
+        "400": { description: "validation error – BAD_INPUT, the crowd codes above, BAD_SPLIT / BUYBACK_UNAVAILABLE / HOLDERS_UNAVAILABLE for `feeSplit`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { description: "CROWD_NOT_ENABLED for mode=crowd on a chain without a CrowdFactory; FEE_SPLIT_OFF for `feeSplit` / `generation: 3` where contracts.launchFactoryG3 is null" }
         "429": { description: rate limited }
+        "503": { description: "CROWD_SPLIT_UNREADABLE (retriable): contracts.crowdFactory is a generation-3 factory and did not answer feeSplit(), which the create call must restate" }
   /launches/simulate:
     post:
       tags: [compute]

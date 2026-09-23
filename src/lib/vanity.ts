@@ -109,6 +109,11 @@ export interface VanityConfig {
     fairTokenDeployer: string;
     simpleTokenDeployer: string;
     zap?: string | null;
+    /** Generation 3 (the fee split) – ADDITIVE fields: `launchFactory` and
+     *  `zap` above keep describing generation 2 for ever. Absent on a backend
+     *  that predates them. */
+    launchFactoryG3?: string | null;
+    zapG3?: string | null;
   };
   features?: { quotePairs?: boolean };
 }
@@ -175,12 +180,56 @@ export function planVanityMine(i: {
   quoteSelected: boolean;
   /** GET /api/v1/config, or null when it could not be read. */
   cfg: VanityConfig | null;
-  fallback: { fairTokenDeployer: string; simpleTokenDeployer: string; quoteAware?: boolean };
+  fallback: {
+    fairTokenDeployer: string; simpleTokenDeployer: string; quoteAware?: boolean;
+    /** This build's registry's generation-3 zap (lib/config.ts STATIC_ZAP_G3),
+     *  for a backend that serves generation 3 but does not publish `zapG3`. */
+    zapG3?: string | null;
+  };
   token: { name: string; symbol: string; totalSupply: bigint };
 }): VanityPlan {
   const fail = { ok: false, reason: 'shapeUnknown' } as const;
   const factory = i.factory;
   if (!isAddress(factory)) return fail;
+
+  // ---- generation 3 (the fee split) --------------------------------------
+  // The backend names generation 3 in ADDITIVE fields – `launchFactory` stays
+  // the generation-2 factory for ever – so a create sent to the G3 factory is
+  // recognised by `launchFactoryG3`, never by `launchFactory`. What the G3
+  // factory hashes:
+  //  - DEPLOYERS: the generation reuses the two token deployers of the one
+  //    before it (D13 – read back off the chain: the G3 factory's
+  //    fairTokenDeployer()/simpleTokenDeployer() are the served ones), so the
+  //    config's two deployer fields answer for it too. A drift is caught by the
+  //    simulation guard (`vanityMismatch`) before any vanity fee is signed.
+  //  - SHAPE: generation 3 keeps its LINEAGE's token – five arguments on the
+  //    shared lineage (the §12b router), four on the stable one – which is a
+  //    fact about this build's chain, not about `factoryVersion` (that field
+  //    describes the generation-2 factory).
+  //  - ROUTER: `quoteMode ? zapRouter : address(0)`, and the G3 factory's
+  //    zapRouter is its OWN zap (`zapG3`) – the old one refuses its launches.
+  const g3 = i.cfg !== null && sameAddress(i.cfg.contracts.launchFactoryG3, factory) ? i.cfg : null;
+  if (g3) {
+    if (i.kind === 'direct') {
+      const deployer = g3.contracts.simpleTokenDeployer;
+      if (!isAddress(deployer)) return fail;
+      return { ok: true, contract: 'OpenSimpleToken', deployer, ctor: { ...i.token, holder: factory, router: null } };
+    }
+    const deployer = g3.contracts.fairTokenDeployer;
+    if (!isAddress(deployer)) return fail;
+    let router: Hex | null = null;
+    if (STATIC_TABLE_QUOTE_AWARE) {
+      const zap = isAddress(g3.contracts.zapG3) ? g3.contracts.zapG3 : i.fallback.zapG3 ?? null;
+      if (!i.quoteSelected) router = ZERO_ADDRESS;
+      else if (isAddress(zap)) router = zap;
+      // A quote launch whose generation-3 zap nobody names: no salt is offered.
+      else return fail;
+    } else if (i.quoteSelected) {
+      // The stable lineage has no quote pairs to launch against.
+      return fail;
+    }
+    return { ok: true, contract: 'OpenFairToken', deployer, ctor: { ...i.token, holder: deployer, router } };
+  }
   // The backend describes ONE generation: the factory NEW launches go to. That
   // may not be the factory this create is sent to – after a v3 rollout the API
   // reports v3 while the build-time table still sends every native launch to

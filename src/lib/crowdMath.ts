@@ -88,6 +88,33 @@ export const STRICT_MIN_VESTING = 7_776_000; // 90 days
 export const STRICT_MAX_TEAM_BPS = 1000;
 export const STRICT_MAX_WALLET_CAP_BPS = 500n;
 
+/** Below this many days of author vesting, the redemption floor is a formality
+ *  and every surface that shows a schedule says so in words.
+ *
+ *  A DISPLAY threshold, and deliberately not one of the four above:
+ *   - nothing refuses a raise for being under it. Since 2026-09-20 the factory's
+ *     own floor is ONE day (CrowdFactory.MIN_VESTING), because a small raise has
+ *     to reach the person who is supposed to build with it;
+ *   - `STRICT_MIN_VESTING` (90 days) answers the checklist's question and the
+ *     backend holds its own copy of that number. This one is not sent anywhere
+ *     and has no twin to drift from.
+ *
+ *  What it marks is arithmetic, not taste: the floor pays out of the UNMATURED
+ *  pot (`floorAt` below), so on the day the schedule ends it is exactly zero and
+ *  `redeem()` reverts. A month is the point past which "there is a way back for
+ *  a while" stops being a fair description of the offer. */
+export const SHORT_VESTING_DAYS = 30;
+
+/** Is this schedule short enough to warn about? `seconds` is the CONTRACT's
+ *  vestingDuration.
+ *
+ *  Zero is "not answered", never "instant": no live raise can carry a zero
+ *  duration (OpenCrowd's constructor refuses it outright), so a zero here is a
+ *  chain read or a wire field that has not arrived – and a warning printed over
+ *  missing data is a worse lie than the one it would prevent. */
+export const isShortVesting = (seconds: number): boolean =>
+  seconds > 0 && seconds < SHORT_VESTING_DAYS * 86_400;
+
 // ------------------------------------------------------------------ helpers
 
 const abs = (v: bigint) => (v < 0n ? -v : v);

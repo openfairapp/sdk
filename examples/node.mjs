@@ -29,12 +29,30 @@ console.log(items.map((t) => `${t.symbol} (${t.mode})`).join(', '), '| next:', n
 const stats = await sdk.referrals.getStats('0xYourReferralWallet');
 console.log(`${stats.launches} referred launches, claimable: ${stats.claimableWei} wei`);
 
+// Generation 3 – the enforced LP-fee split (1.4.0), opt-in. launch.target() answers where a
+// create would go without pricing it. Only an opted-in config (feeSplit or generation: 3) reads
+// GET /api/v1/config (one cached read); without one a create is exactly 1.3.x, generation 2.
+console.log('generation-3 factory:', sdk.manifest.contracts.factoryG3 ?? 'none on this chain');
+try {
+  // bps of the WHOLE quote side / of the whole token side; buybackBps must be 0 (not live yet)
+  const t = await sdk.launch.target({ feeSplit: { holdersBps: 1500, buybackBps: 0, tokenHoldersBps: 2500 } });
+  console.log(`would create on generation ${t.generation} via ${t.factory}`, t.feeSplit);
+} catch (e) {
+  // BadInput (contractReason BadSplit / BuybackUnavailable / HoldersUnavailable) before any
+  // signature, or NetworkUnavailable (retriable) while the config cannot be reached
+  console.log(`fee split refused: ${e.code}${e.contractReason ? ` (${e.contractReason})` : ''} – ${e.message}`);
+}
+
 // Pay a paired launch in ETH through OpenZap (null where the zap is not deployed –
-// zapQuote / buyWithEth / sellForEth then throw ZapUnavailable instead of guessing):
-console.log('OpenZap:', sdk.manifest.contracts.zap ?? 'not deployed on this chain');
+// zapQuote / buyWithEth / sellForEth then throw ZapUnavailable instead of guessing).
+// Since 1.4.0 the zap is chosen per launch by its factory(): `zap` for generation 2,
+// `zapG3` for generation 3 – each serves only its own factory's launches.
+console.log('OpenZap:', sdk.manifest.contracts.zap ?? 'not deployed on this chain',
+  '| generation 3:', sdk.manifest.contracts.zapG3 ?? 'none');
 //   const q = await sdk.tokens.zapQuote('0xPairedCurveToken', { ethIn: 10n ** 16n }); // 0.01 ETH
-//   q.poolFee (500 / 3000 / 10000), q.quoteOut (pair asset the swap delivers), q.amountOut (curve tokens)
+//   q.zap (the OpenZap it routes through), q.poolFee (500 / 3000 / 10000),
+//   q.quoteOut (pair asset the swap delivers), q.amountOut (curve tokens)
 //   await sdk.tokens.buyWithEth('0xPairedCurveToken', { ethIn: 10n ** 16n, slippageBps: 200 });
 
-// Verify you are talking to the real factory:
+// Verify you are talking to the real factory (the result carries its `generation` since 1.4.0):
 console.log(await sdk.contracts.verifyDeployment());

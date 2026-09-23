@@ -146,6 +146,26 @@ const NET_KEY = IS_ARC ? 'arc' : IS_STABLE ? 'stable' : 'robinhood';
 const NET_ENTRY = REGISTRY.find((n) => n.key === NET_KEY) ?? REGISTRY[0];
 const ECON = NET_ENTRY.economics;
 
+/**
+ * Which CONTRACT LINEAGE this deployment runs – the registry's own `lineage`.
+ *
+ * 'shared' is contracts/src/ (Robinhood): an 18-decimal native coin with a real
+ * WETH9 behind it. 'stable' is contracts/src/stable/ (Arc 5042, Stable 988):
+ * the chain's coin IS the dollar, its ERC-20 face is the same balance at six
+ * decimals, and there is nothing to wrap.
+ *
+ * It is not a synonym for "which chain": it is the question every encoder has
+ * to ask, because the two lineages compile DIFFERENT structs under the same
+ * names. lib/vanity.ts already asks it of the constructor arity; lib/crowdAbi.ts
+ * asks it of the crowd tuple, whose stable build has no `quote` field at all
+ * (25 fields, selector 0x32520209) where the shared one has 26 (0xc61106a9).
+ * A tuple is positional, so that is not a type error anywhere – it is a
+ * different call, decoded into different slots.
+ */
+export const LINEAGE: string = NET_ENTRY.lineage;
+/** Shorthand for the question above, so no consumer re-spells the string. */
+export const IS_STABLE_LINEAGE: boolean = LINEAGE === 'stable';
+
 /** This deployment's own origin – every subdomain self-canonicalizes. */
 export const SITE_ORIGIN = NET_ENTRY.origin;
 
@@ -249,11 +269,13 @@ export const STATIC_FACTORY_QUOTE_AWARE: boolean = QUOTE_AWARE_TABLE[NET_KEY] ??
  * Does THIS build's chain have crowd-launch contracts at all (plan §0.3)?
  *
  * Crowd launch is a separate factory with its own children, deployed on
- * Robinhood Chain (2026-09-10) and Arc testnet (2026-09-12). Stable has none,
- * so the backend zeroes the address in its override block – but the
- * three deployments share ONE env template, and a single wrong answer from a
- * running backend would otherwise light the crowd catalogue up on a bundle
- * built for a chain where nothing can be signed.
+ * Robinhood Chain (2026-09-10, the shared lineage) and on Arc mainnet
+ * (2026-09-17, the stable lineage's own 25-field factory – the Arc testnet set
+ * of 2026-09-12 died with that network). Stable (988) has none, so the backend
+ * zeroes the address in its override block – but the three deployments share
+ * ONE env template, and a single wrong answer from a running backend would
+ * otherwise light the crowd catalogue up on a bundle built for a chain where
+ * nothing can be signed.
  *
  * So the site's predicate is a CONJUNCTION, not a fallback: this build-time
  * table AND `features.crowdLaunch` from /api/v1/config (see
@@ -272,6 +294,73 @@ const CROWD_TABLE: Record<string, boolean> = Object.fromEntries(
   REGISTRY.map((n) => [n.key, n.crowd === true]),
 );
 export const STATIC_CROWD_SUPPORTED: boolean = CROWD_TABLE[NET_KEY] ?? false;
+
+/**
+ * The crowd factory THIS build's registry names, or null where it names none.
+ *
+ * It is what pins the runtime answer. The address a create is signed against
+ * comes from the running backend (GET /api/v1/config `contracts.crowdFactory`),
+ * because that is the value the deployment is actually configured with – but
+ * the table above stops being a guard on the day a chain's row turns true, and
+ * the three deployments still share ONE env template. So where the registry
+ * knows the address, a backend answering with a DIFFERENT one reads as "off"
+ * rather than as a destination (lib/exploreApi.ts crowdFactoryFor): a bundle
+ * built for 5042 cannot be talked into signing against 4663's factory by a
+ * stale `CROWD_FACTORY=` line.
+ *
+ * Every stable-lineage switch-on carries the address here – that is the rule
+ * tests/crowd-lineage-abi.test.mjs enforces, because on this lineage `crowd:
+ * true` is a claim about a factory whose 25-field tuple the bundle encodes at
+ * build time. The shared lineage carries none, so this is null on Robinhood and
+ * the runtime answer stands alone there exactly as it did before Arc: null is
+ * "the registry has no opinion", never "no factory".
+ */
+export const STATIC_CROWD_FACTORY: string | null = NET_ENTRY.crowdContracts?.factory ?? null;
+
+/**
+ * GENERATION 3 – the enforced fee split – as this build's registry names it,
+ * or null where the chain has none (Stable 988; `zapG3` also on Arc, which has
+ * no quote pairs).
+ *
+ * NEW NAMES, on purpose, and never folded into ADDR or STATIC_CROWD_FACTORY
+ * above. The backend's `contracts.launchFactory` / `crowdFactory` / `zap` keep
+ * their generation-2 meaning for ever: pinned SDK bundles bake the generation-2
+ * factory in at build time and third parties encode against it, so repointing
+ * those names would be a silent change of selector under every integrator.
+ * First-party clients opt in instead, through ADDITIVE fields –
+ * `features.storefrontG3` and `contracts.launchFactoryG3` / `crowdFactoryG3` /
+ * `zapG3` – and these constants are what PIN that runtime answer: a backend
+ * naming a different address reads as "off", exactly as STATIC_CROWD_FACTORY
+ * pins `crowdFactory` (lib/feeSplit.ts g3LaunchFactoryFor, lib/exploreApi.ts
+ * crowdFactoryG3For, lib/launchZap.ts).
+ *
+ * Named exports and not ADDR keys, because sdk/core.ts imports ADDR whole and
+ * reads the generation-2 slots by name; these are for the storefront only.
+ */
+export const STATIC_LAUNCH_FACTORY_G3: string | null = NET_ENTRY.contracts.launchFactoryG3 ?? null;
+export const STATIC_CROWD_FACTORY_G3: string | null = NET_ENTRY.contracts.crowdFactoryG3 ?? null;
+export const STATIC_ZAP_G3: string | null = NET_ENTRY.contracts.zapG3 ?? null;
+
+/**
+ * Is a raise on THIS chain denominated in the chain's own coin and nothing
+ * else?
+ *
+ * True on the stable lineage, where it is a property of the CONTRACT and not a
+ * setting: that CrowdFactory's `CrowdParams` has no `quote` field at all (25
+ * fields against the shared build's 26), `OpenCrowd.quote()` is address(0) and
+ * `isNative()` is true for every raise it can ever deploy, and there is no
+ * `contributeQuote` on the raise. The chain's coin IS the dollar there (Arc's
+ * USDC, Stable's USDT0), so "pay in the coin or pay in a dollar asset" is not a
+ * choice anybody could make.
+ *
+ * Read by the crowd encoder (lib/createPayload.ts, which drops the field) and
+ * by every crowd surface that would otherwise offer a quote/native toggle,
+ * a `feeCapUsd` line or an ERC-20 approval. It is NOT the same question as
+ * `QUOTE_PAIRS_OFFERED`: that one is about the LAUNCH factory's allow-list and
+ * is answered by the running backend, this one is about which struct the crowd
+ * factory in this build's lineage decodes, and no backend can change it.
+ */
+export const CROWD_NATIVE_ONLY: boolean = IS_STABLE_LINEAGE;
 
 /**
  * QuoteRegistry for this deployment: the allow-list of ERC-20 assets a launch
@@ -332,15 +421,19 @@ export const HAS_BRIDGE: boolean = NET_ENTRY.bridge === true;
  *
  * CHAIN.explorer is always a URL – components build `${explorer}/address/…`
  * links from it and an empty string would turn every one of them into a
- * relative path into our own SPA. But on Arc the only explorer that exists,
- * explorer.arc.io (the host Circle's docs, Uniswap's chain config and Relay
- * all name), answers a Cloudflare Access login for Circle SSO on every path,
- * /api/v2 included. So the link is correct and the promise is not: a surface
- * that tells a reader "look it up in the explorer" asks THIS first, and
- * offers the DexScreener pair page or the Uniswap token page instead.
+ * relative path into our own SPA. But a URL being correct is not the same as a
+ * reader being able to open it: Arc's only explorer, explorer.arc.io (the host
+ * Circle's docs, Uniswap's chain config and Relay all name), answered a
+ * Cloudflare Access login for Circle SSO on every path for one day after the
+ * mainnet cutover. A surface that tells a reader "look it up in the explorer"
+ * asks THIS first, and offers the DexScreener pair page or the Uniswap token
+ * page instead when the answer is no.
  *
- * Read from the registry so one edit re-opens every such surface on the day
- * Circle opens the explorer.
+ * TRUE ON EVERY CHAIN since 2026-09-17, when Circle opened explorer.arc.io as
+ * an ordinary public Blockscout. The constant stays, and so does every branch
+ * that reads it – one registry line (`explorerPublic: false`) closes every such
+ * surface again, for this chain or the next one, which is exactly why the
+ * question is asked of the registry and never of the chain key.
  */
 export const EXPLORER_PUBLIC: boolean = NET_ENTRY.explorerPublic !== false;
 
@@ -403,13 +496,34 @@ export const DEX_TOKEN_URL: ((token: string) => string) | null = NET_ENTRY.dexTo
  */
 export const NATIVE_QUOTE_DECIMALS: number = NET_ENTRY.nativeQuote.decimals;
 export const NATIVE_QUOTE_WRAPPED: boolean = NET_ENTRY.nativeQuote.wrapped;
+/** Is the native coin ITSELF a dollar stablecoin (Arc's USDC, Stable's
+ *  USDT0)? A third, independent fact – never inferred from `decimals`, since
+ *  a 6-decimal face is what a wrapped native ERC-20 face looks like on this
+ *  chain, not what makes it a dollar. Drives the trade panel's quick-buy
+ *  presets: dollar sizes here, ETH-sized fractions on Robinhood. */
+export const NATIVE_QUOTE_STABLE: boolean = NET_ENTRY.nativeQuote.stable === true;
+
+/** Default "You pay" amount for a native buy: a round dollar where the coin
+ *  IS a dollar, the old ETH-sized fraction everywhere else. Single source for
+ *  every input that resets to "the small default" – src/pages/Token.tsx and
+ *  src/components/SwapPanel.tsx both read this instead of restating '0.01'. */
+export const NATIVE_BUY_DEFAULT: string = NATIVE_QUOTE_STABLE ? '1' : '0.01';
 
 /** Where this chain's contracts are verified, and under what name: the block
- *  explorer where there is a public one, Sourcify on Arc. Injected into the
- *  locale strings as {verifyName}/{verifyUrl} (lib/i18n.ts) so no dictionary
- *  carries a chain's explorer host as a literal – which is how ten locales
- *  came to promise Blockscout on a chain that has none. */
+ *  explorer on Robinhood and Stable, and on Arc BOTH targets named in one
+ *  phrase ("explorer.arc.io (Blockscout) and Sourcify") because the verify
+ *  worker submits to both there. Injected into the locale strings as
+ *  {verifyName}/{verifyUrl} (lib/i18n.ts) so no dictionary carries a chain's
+ *  explorer host as a literal – which is how ten locales came to promise
+ *  Blockscout on a chain that did not have it. */
 export const VERIFY_NAME: string = NET_ENTRY.verify.name;
+/** What the chain's own EXPLORER is called – a different question from
+ *  VERIFY_NAME wherever a chain verifies against more than its explorer, which
+ *  Arc does (Blockscout AND Sourcify). Used where a PRODUCT is being named –
+ *  the wallet's View-on-explorer entry – rather than a verification promise.
+ *  Falls back to VERIFY_NAME, which is what every chain whose explorer is its
+ *  only verification target already says. */
+export const EXPLORER_NAME: string = NET_ENTRY.explorerName ?? NET_ENTRY.verify.name;
 export const VERIFY_URL: string = NET_ENTRY.verify.url;
 
 /** This deployment's own machine surfaces: the versioned REST base and the MCP

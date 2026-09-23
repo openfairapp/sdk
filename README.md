@@ -14,8 +14,9 @@ npm install @openfair/sdk viem
 Or drop-in for any web page (no build step):
 
 ```html
-<script src="https://sdk.openfair.app/v1.3.3/openfair.js"
-        integrity="sha384-…" crossorigin="anonymous"></script>
+<script src="https://sdk.openfair.app/v1.4.1/openfair.js"
+        integrity="sha384-Ors1kkp+TIlZnXxqZoRt/ZlJ3EB4Wd+VTBvo7IlsxQy+4WaPAV+53WPXZpoHcajV"
+        crossorigin="anonymous"></script>
 <openfair-create ref="0xYourWallet"></openfair-create>
 ```
 
@@ -84,6 +85,34 @@ await sdk.tokens.sellForEth(token, { tokensIn: 1_000n * 10n ** 18n });
 ```
 
 The same three methods are mirrored on `sdk.launch`. Both floors – the pool leg and the curve leg – come from `slippageBps` (default 2 %); never pass `0`, the contract accepts it and it makes the trade a free sandwich. `contracts.zap` is `null` on a chain without a deployment and the calls then throw `ZapUnavailable` instead of guessing an address. Graduated tokens need no zap at all: their pool is token/pair, so a router `exactInput` over the packed path `WETH → pair → token` does it.
+
+## Fee split – generation 3 (1.4.0)
+
+Generation 3 of the launch factory enforces where the LP fee goes: a share of the quote side to the token's holders, and a share of the token side to holders instead of the burn. It is **opt-in**: a launch config without `feeSplit` / `generation: 3` is created exactly as before, and the SDK reads nothing new for it.
+
+```ts
+const quote = await sdk.launch.quote({
+  mode: 'fair', name: 'My Token', symbol: 'MTK', platformShareBps: 5000,
+  // bps of the WHOLE quote side / of the whole token side
+  feeSplit: { holdersBps: 1500, buybackBps: 0, tokenHoldersBps: 2500 },
+});
+quote.generation; // 3 where the chain serves it
+quote.factory;    // manifest.contracts.factoryG3 – approvals and fees follow it
+quote.feeSplit;   // exactly what is signed
+```
+
+- Generation 3 is used only while the chain's own backend (`apiBase`) says `features.storefrontG3` and names `contracts.factoryG3` in `GET /api/v1/config` (one cached read). Another chain's answer reads as "off": for Arc pass `apiBase: 'https://arc.openfair.app'`. Stable (988) has no generation 3.
+- `platformShareBps + holdersBps + buybackBps <= 10000`, every non-zero share `>= 100`, `buybackBps` must be `0` (the leg is not live), and a holders' share needs both `features.feeSplit` and `features.holdersPublisher` – anything else is an `OpenfairError('BadInput')` before any signature (while the config cannot be reached at all, a holders' share is a retriable `NetworkUnavailable` instead). A split that routes something is never silently dropped where generation 3 is off.
+- `GET /api/v1/config` is read only for an opted-in create (and `diagnostics({ generation: 3 })`), past the browser's HTTP cache, and cached by the SDK for 60 s.
+- `launch.target(config)` answers `{ generation, factory, feeSplit }` without pricing; `LaunchResult.generation` / `feeSplit` report what the chain recorded.
+- A vanity `salt` pins the factory (the token's CREATE2 address depends on it): an opted-in create with a salt goes to generation 3 or is refused, never to a generation-2 fallback; `predictAddress()` follows the same rule, and `simulate()` checks the token the factory itself names against the prediction (`VanityMismatch`) before the vanity fee is signed.
+- Widget: `<openfair-create fee-split="1500/0/2500">` shows the split read-only above the button; a config read that merely failed is retried, not shown as a refusal.
+- `contracts.info()` returns the ABI of the factory's own shape (quote-aware on 4663; `{ generation: 3 }` for the generation-3 factory).
+- 1.4.0 also chooses the OpenZap per launch (by its `factory()`) – a chain with generation 3 has two zaps, and each serves only its own factory's launches.
+
+## Token symbol (1.4.1)
+
+openfair.app, `POST /v1/launches/quote` and the `<openfair-create>` widget take any script – Latin, Cyrillic, CJK, emoji – 1 to 11 characters as MetaMask counts them (UTF-16 code units: an emoji takes two or more), no whitespace or control characters; the ends are trimmed and it is upper-cased. 11 is MetaMask's symbol limit for adding a token to the wallet. The headless `launch.quote()` sends `symbol` as given and only requires it to be non-empty.
 
 ## What's inside
 

@@ -16,17 +16,29 @@
   <h1>Launch a token</h1>
   <!-- Pinned build + SRI (every version's hash: https://sdk.openfair.app/sri.json).
        https://sdk.openfair.app/openfair.js tracks the latest release without a hash. -->
-  <script src="https://sdk.openfair.app/v1.3.3/openfair.js"
-          integrity="sha384-YKLOk+dRO83qkI8j1LBJJh6aProOwmkSfe79eK5gdjhpNKRkzc6mE7Ozcpakc+J2" crossorigin="anonymous"></script>
+  <script src="https://sdk.openfair.app/v1.4.1/openfair.js"
+          integrity="sha384-Ors1kkp+TIlZnXxqZoRt/ZlJ3EB4Wd+VTBvo7IlsxQy+4WaPAV+53WPXZpoHcajV" crossorigin="anonymous"></script>
   <!-- Attributes: ref (your referral wallet), lang, mode="fair|instant" (locks the mode),
        pair="0x…" (fixes the quote asset; omit it to let the user pick one where pairs exist),
        chain-id (since 1.3.2) – the deployment to launch on: 4663 Robinhood Chain, 988 Stable,
-       5042 Arc. Omit it and the widget uses the chain this bundle was built for. -->
+       5042 Arc. Omit it and the widget uses the chain this bundle was built for.
+       fee-split="holders/buyback/tokenHolders" (since 1.4.0) – three whole bps, e.g. "1500/0/2500":
+       creates on generation 3 (the enforced LP-fee split) where the chain serves it. The split is
+       shown read-only above the button; one the chain cannot take disables the button with the
+       reason; a malformed value replaces the form with a BadInput error. Omit it for generation 2.
+       The ticker field takes any script, 1–11 characters as MetaMask counts them (since 1.4.1). -->
+  <script>
+    // of-ready fires while the element connects – before any script below it runs.
+    // It bubbles, so catch it on document from a script placed above the element.
+    document.addEventListener('of-ready', (e) => console.log('ready:', e.detail)); // { mode, feeSplit }
+  </script>
   <openfair-create ref="0xYourReferralWallet" lang="en" chain-id="4663"></openfair-create>
   <script>
     const el = document.querySelector('openfair-create');
     el.addEventListener('of-pair-change', (e) => console.log('pair:', e.detail)); // { quote, symbol }
-    el.addEventListener('of-created', (e) => console.log('token created:', e.detail)); // { address, txHash, mode }
+    // { address, txHash, mode, feeSplit, generation } – what the chain recorded:
+    // the split of a generation-3 create, null on generation 2
+    el.addEventListener('of-created', (e) => console.log('token created:', e.detail));
     // Headless API from the same bundle: window.Openfair, Openfair.version, Openfair.chains (manifests)
   </script>
 </body>

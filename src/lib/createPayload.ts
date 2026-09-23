@@ -14,6 +14,12 @@ import { parseEther, parseUnits } from 'viem';
 // stripping), and node does not resolve extensionless specifiers.
 import { num, teamVestingDaysOf, CROWD_MIN_DAYS, type CreateDraft } from './createValidate.ts';
 import { DEADLINE_MARGIN } from './crowdMath.ts';
+// The one build-time fact this module needs: does THIS build's CrowdFactory
+// declare a `quote` field at all? See the note on buildCrowdParams.
+import { CROWD_NATIVE_ONLY } from './config.ts';
+// ---- BEGIN fee split: the generation-3 argument ----
+import type { FeeSplitArg } from './feeSplit.ts';
+// ---- END fee split ----
 
 export const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as `0x${string}`;
 export const ZERO_SALT = `0x${'0'.repeat(64)}` as `0x${string}`;
@@ -184,19 +190,77 @@ export function buildDirectParams(input: PayloadInput): DirectParams {
 export const seedUnits = (input: PayloadInput): bigint =>
   amountUnits(input.draft.seedLiquidity, input.decimals);
 
+// ---- BEGIN fee split: the generation-3 argument (FEE_SPLIT_DESIGN D15/D21) --
+//
+// Generation 3 appends ONE argument – the enforced `FeeSplit` – between the
+// params struct and the rest. The builders above are untouched: the split is
+// not a field of either struct and must never become one, because a new field
+// inside them would move `LaunchCreated`'s topic0 and break nine decoders that
+// have nothing to do with this feature.
+//
+// `split === null` is the CURRENT fleet, and the two functions then return
+// exactly the argument lists this page has always built – same order, same
+// values, byte-identical calldata. tests/fee-split-create.test.mjs pins that
+// against the deployed factory's own compiled ABI, because "the create flow
+// must keep working against the current factories" is a property nobody
+// notices breaking until a launch cannot be signed.
+//
+// Typed as `unknown[]`: the two generations have different ABIs and viem types
+// a call from the ABI it is given, so the args list is assembled here and
+// handed to whichever encoder the create path picked.
+
+/** `createLaunch(params [, split], referrer, cid)`. */
+export function launchArgs(
+  params: unknown,
+  split: FeeSplitArg | null,
+  referrer: `0x${string}`,
+  cid: string,
+): readonly unknown[] {
+  return split === null ? [params, referrer, cid] : [params, split, referrer, cid];
+}
+
+/** `createDirectListing(params [, split], cid)`. */
+export function listingArgs(
+  params: unknown,
+  split: FeeSplitArg | null,
+  cid: string,
+): readonly unknown[] {
+  return split === null ? [params, cid] : [params, split, cid];
+}
+
+/**
+ * `createCrowdLaunch(params [, split], referrer, cid)` – the same insertion on
+ * the crowd factory's generation 3, in the same slot.
+ *
+ * On a raise the split is NOT the creator's: it is the factory's owner-set
+ * `feeSplit()`, which the page reads and hands in here verbatim (the create
+ * reverts `BadConfig()` on anything else). `null` is the generation-2 crowd
+ * factory, and then the list is exactly the one this page has always built.
+ */
+export function crowdArgs(
+  params: unknown,
+  split: FeeSplitArg | null,
+  referrer: `0x${string}`,
+  cid: string,
+): readonly unknown[] {
+  return split === null ? [params, referrer, cid] : [params, split, referrer, cid];
+}
+// ---- END fee split: the generation-3 argument ------------------------------
+
 // ------------------------------------------------------------------- crowd --
 
 /**
- * `CrowdParams`, all 26 fields in DECLARATION ORDER (CrowdFactory.sol:155-187).
+ * `CrowdParams`, in DECLARATION ORDER (CrowdFactory.sol:155-187) – the 25
+ * fields BOTH lineages share.
+ *
  * A tuple is positional: one field moved is a different launch, not a type
  * error, so this interface is written in the contract's order and read straight
  * into `crowdFactoryAbi`'s struct.
  */
-export interface CrowdParams {
+export interface CrowdParamsBase {
   name: string;
   symbol: string;
   salt: `0x${string}`;
-  quote: `0x${string}`;
   feeRecipient: `0x${string}`;
   teamBeneficiary: `0x${string}`;
   pricePerToken: bigint;
@@ -221,12 +285,26 @@ export interface CrowdParams {
   poolFeeTier: number;
 }
 
+/**
+ * What `buildCrowdParams` returns on THIS build.
+ *
+ * `quote` sits at index 3 of the SHARED lineage's tuple and does not exist in
+ * the stable one at all – the chain's coin IS the dollar there and every raise
+ * that factory can deploy is native. So the field is optional in the type and
+ * present or absent in the value, decided once at module level from the
+ * registry's `lineage` (CROWD_NATIVE_ONLY), never both-and-zero.
+ */
+export type CrowdParams = CrowdParamsBase & { quote?: `0x${string}` };
+
 export interface CrowdPayloadInput {
   /** MUST be normalizeDraft(draft). */
   draft: CreateDraft;
-  /** Decimals of the raise currency (18 native). */
+  /** Decimals of the raise currency (18 native – including on the stable
+   *  lineage, where the coin is an 18-decimal dollar and every amount the
+   *  creator types is a dollar: 10 USDC is 10e18 wei of msg.value). */
   decimals: number;
-  /** null = the raise is denominated in the chain's coin. */
+  /** null = the raise is denominated in the chain's coin. IGNORED on the stable
+   *  lineage, whose tuple has no `quote` field to put an address in. */
   quoteAddress: `0x${string}` | null;
   /**
    * keccak256 of exactly the bytes the metadata endpoint pinned. The field is
@@ -271,8 +349,20 @@ const days = (raw: string | number): bigint => {
 const bps = (raw: string | number): number => Math.round(n0(raw) * 100);
 
 /**
- * The 26 arguments a crowd launch is created with – the ONE builder, so the
+ * The arguments a crowd launch is created with – the ONE builder, so the
  * Review step and the transaction cannot disagree (plan §3.1).
+ *
+ * TWENTY-SIX on the shared lineage, TWENTY-FIVE on the stable one, and the
+ * difference is the whole `quote` field: that factory's CrowdParams does not
+ * declare it, because the chain's coin IS the dollar and every raise is native
+ * (OpenCrowd.quote() = address(0), isNative() true). The key is therefore not
+ * set to the zero address there – it is ABSENT, so `Object.keys` is 25 and the
+ * shape cannot be mistaken for the other lineage's by anything downstream.
+ *
+ * Whichever shape this build produces, the encoder it feeds is the matching one
+ * (lib/crowdAbi.ts, same registry `lineage`), so the two are never mixed: the
+ * stable tuple encoded under the shared ABI would shift every field from
+ * `feeRecipient` on by one slot and revert nothing.
  *
  * Three of the fields are not the form's numbers and are worth naming:
  *  - `totalSupply` is ALWAYS 0. The factory derives the supply from the price
@@ -302,7 +392,10 @@ export function buildCrowdParams(input: CrowdPayloadInput): CrowdParams {
     // invert – reusing its output would buy an address the deployer never
     // produces (plan §3.1).
     salt: ZERO_SALT,
-    quote: input.quoteAddress ?? ZERO_ADDRESS,
+    // Index 3 on the shared lineage, and NOTHING on the stable one – the field
+    // does not exist in that struct. Spread rather than a zero address, so a
+    // stable tuple has 25 keys and a reviewer counting them sees the truth.
+    ...(CROWD_NATIVE_ONLY ? {} : { quote: input.quoteAddress ?? ZERO_ADDRESS }),
     // address(0) = msg.sender, which is what the factory substitutes.
     feeRecipient: ZERO_ADDRESS,
     teamBeneficiary: (d.teamWallet.trim() || ZERO_ADDRESS) as `0x${string}`,

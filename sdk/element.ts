@@ -7,7 +7,17 @@
 // (JSON) or the `.dictionary` property.
 // Chain: `chain-id` picks the deployment to launch on; absent = the chain this
 // bundle was built for (see connectedCallback for why that default bites).
-import { Openfair, type LaunchResult, type ProgressEvent, type QuoteAsset } from './core';
+// Fee split (1.4.0): `fee-split="holders/buyback/tokenHolders"` – three bps –
+// creates on generation 3 where the chain serves it; the split is shown
+// read-only above the button, and a split the chain cannot take disables it.
+// A config read that merely failed (timeout, 5xx) disables nothing: it is
+// retried on a short backoff and on the next click.
+// Ticker (1.4.1): the site's rule – any script, 1 to 11 characters (MetaMask's
+// symbol limit), no whitespace or control characters; trimmed and upper-cased.
+// Until 1.4.0 the widget silently kept the first 8 UTF-16 units.
+import { Openfair, type FeeSplitArg, type LaunchResult, type ProgressEvent, type QuoteAsset } from './core';
+import { enforcedShares } from '../src/lib/feeSplit';
+import { TICKER_MAX, normalizeTicker, tickerOk } from '../src/content/ticker.mjs';
 
 type Lang = 'en' | 'ru';
 
@@ -23,11 +33,17 @@ const T: Record<Lang, Record<string, string>> = {
     created: 'Token created 🎉', copy: 'copy', copied: 'copied ✓',
     trade: 'Trade on Uniswap', open: 'Open on openfair',
     errRequired: 'Fill in the token name and ticker.',
+    errTicker: 'Ticker: 1 to {max} characters in any script, no spaces.',
     stMetadata: 'Pinning metadata…', stSimulating: 'Simulating…', stWallet: 'Confirm in your wallet…',
     stConfirming: 'Waiting for the chain…', stIndexing: 'Indexing…',
     pair: 'Pair with', pairNative: '{cur} – the chain coin',
     stApproving: 'Approving {sym}…',
     pairNote: 'Two signatures: the factory pulls {sym} from your wallet, so it asks for an approval first.',
+    split: 'Where the pool fees go',
+    splitQuote: 'Pool side: platform {platform} · creator {creator} · holders {holders}',
+    splitBuyback: 'buy-back {buyback}',
+    splitToken: 'Token side: holders {holders} · burned {burn}',
+    splitOff: 'This fee split cannot be created here: {reason}',
   },
   ru: {
     modeInstant: 'Мгновенный листинг', modeFair: 'Честный запуск',
@@ -40,11 +56,17 @@ const T: Record<Lang, Record<string, string>> = {
     created: 'Токен создан 🎉', copy: 'копировать', copied: 'скопировано ✓',
     trade: 'Торговать на Uniswap', open: 'Открыть на openfair',
     errRequired: 'Заполните название токена и тикер.',
+    errTicker: 'Тикер: от 1 до {max} символов любой письменности, без пробелов.',
     stMetadata: 'Загружаем метаданные…', stSimulating: 'Симулируем…', stWallet: 'Подтвердите в кошельке…',
     stConfirming: 'Ждём сеть…', stIndexing: 'Индексируем…',
     pair: 'Пара с', pairNative: '{cur} – монета сети',
     stApproving: 'Разрешаем списание {sym}…',
     pairNote: 'Две подписи: фабрика списывает {sym} с вашего кошелька, поэтому сначала просит разрешение.',
+    split: 'Куда идут комиссии пула',
+    splitQuote: 'Сторона пула: платформа {platform} · создатель {creator} · холдеры {holders}',
+    splitBuyback: 'выкуп {buyback}',
+    splitToken: 'Сторона токена: холдеры {holders} · сжигается {burn}',
+    splitOff: 'Такое распределение комиссий здесь создать нельзя: {reason}',
   },
 };
 
@@ -93,6 +115,11 @@ input:focus, textarea:focus, select:focus { outline: 2px solid var(--of-accent, 
 }
 .submit:disabled { opacity: .55; cursor: default; }
 .feeline { text-align: center; font-size: 11.5px; opacity: .6; margin-top: 8px; }
+.split {
+  margin-top: 14px; padding: 10px 12px; font-size: 12px; line-height: 1.5;
+  border: 1px solid var(--of-border, #2c2434); border-radius: calc(var(--of-radius, 16px) * .5);
+}
+.split b { display: block; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; opacity: .65; font-weight: 600; margin-bottom: 4px; }
 .err { color: var(--of-error, #ff7a7a); font-size: 12.5px; margin-top: 10px; }
 .card { text-align: center; }
 .card img { width: 68px; height: 68px; border-radius: 14px; object-fit: cover; margin-bottom: 8px; }
@@ -135,10 +162,19 @@ export class OpenfairCreateElement extends HTMLElementBase {
   // launch is native, exactly as it was.
   private pairs: QuoteAsset[] = [];
   private pair = ''; // '' = the chain's native coin
+  // Fee split (1.4.0): parsed once from `fee-split`; null = attribute absent,
+  // which is every integration before 1.4.0 and stays exactly as it was.
+  private feeSplit: FeeSplitArg | null = null;
+  /** Why the split cannot be created on this chain right now ('' = it can).
+   *  Set only by a VERDICT (BadInput) – never by a config read that failed. */
+  private splitError = '';
+  /** The pending re-resolution after a transient failure, and how many ran. */
+  private targetRetry: ReturnType<typeof setTimeout> | null = null;
+  private targetRetries = 0;
   /** Custom translation overrides (also settable via the `dict` attribute as JSON). */
   dictionary: Partial<Record<string, string>> | null = null;
 
-  static get observedAttributes() { return ['ref', 'lang', 'mode', 'pair', 'api-base', 'chain-id', 'dict']; }
+  static get observedAttributes() { return ['ref', 'lang', 'mode', 'pair', 'api-base', 'chain-id', 'dict', 'fee-split']; }
 
   private fire(name: string, detail?: unknown) {
     this.dispatchEvent(new CustomEvent(name, { bubbles: true, composed: true, detail }));
@@ -173,12 +209,31 @@ export class OpenfairCreateElement extends HTMLElementBase {
       this.fire('of-error', { code: 'BadConfig', stage: 'validating', retriable: false, message });
       return;
     }
+    // `fee-split="h/b/t"` – three bps. A malformed value is the integrator's
+    // mistake, and the form must not create anything under it: a launch
+    // created WITHOUT the split somebody configured is the silent failure the
+    // attribute exists to prevent. So, like an unknown `chain-id`, it replaces
+    // the form with the error. A well-formed split the chain cannot take is a
+    // different case – the form renders, says why, and keeps the button off.
+    const splitAttr = this.getAttribute('fee-split');
+    if (splitAttr !== null) {
+      const parsed = parseFeeSplit(splitAttr);
+      if (!parsed) {
+        const message = `fee-split must be three whole bps "holders/buyback/tokenHolders" (e.g. "1500/0/2500"), got "${splitAttr}"`;
+        this.attachShadow({ mode: 'open' });
+        this.shadowRoot!.innerHTML = `<style>${STYLE}</style>
+        <div role="status" aria-live="polite"><div class="err" part="error">${esc(message)}</div></div>`;
+        this.fire('of-error', { code: 'BadInput', stage: 'validating', retriable: false, message });
+        return;
+      }
+      this.feeSplit = parsed;
+    }
     const m = this.getAttribute('mode');
     if (m === 'fair' || m === 'instant') this.mode = m;
     this.pair = this.getAttribute('pair') ?? '';
     this.attachShadow({ mode: 'open' });
     this.render();
-    this.fire('of-ready', { mode: this.mode });
+    this.fire('of-ready', { mode: this.mode, feeSplit: this.feeSplit });
     this.refreshFee();
     // The allow-list, when the target chain has one. A failure here is not the
     // user's problem: the widget keeps working as a native-only form.
@@ -193,13 +248,24 @@ export class OpenfairCreateElement extends HTMLElementBase {
     }).catch(() => {});
   }
 
+  disconnectedCallback() {
+    if (this.targetRetry !== null) { clearTimeout(this.targetRetry); this.targetRetry = null; }
+  }
+
   /** The selected pair, or null while the launch is native. */
   private selected(): QuoteAsset | null {
     const want = this.pair.toLowerCase();
     return this.pairs.find((q) => q.address.toLowerCase() === want) ?? null;
   }
 
-  /** Fee line under the button, in the unit the launch actually pays in. */
+  /** The fee-split options every SDK call from this widget carries. */
+  private splitOptions(): { feeSplit?: FeeSplitArg } {
+    return this.feeSplit ? { feeSplit: this.feeSplit } : {};
+  }
+
+  /** Fee line under the button, in the unit the launch actually pays in –
+   *  and from the factory the create will be SENT to: with a `fee-split` that
+   *  may be the generation-3 one, whose deployFee is its own knob. */
   private refreshFee() {
     const t = this.t();
     const lang = (this.getAttribute('lang') as Lang) ?? 'en';
@@ -207,21 +273,51 @@ export class OpenfairCreateElement extends HTMLElementBase {
       lang === 'ru' ? 'ru-RU' : 'en-US', { maximumFractionDigits: 6 },
     ).format(Number(wei) / 10 ** decimals);
     const qa = this.selected();
-    if (qa) {
-      // The registry's fee, discounted by the same supporter rule the factory
-      // applies to it – read from the factory, never assumed to be half.
-      this.sdk.supporterFeeBps().then((bps) => {
-        const fee = qa.deployFeeWei! * BigInt(bps) / 10000n;
-        this.feeText = fee === 0n ? `${t.fee}: ${t.free}` : `${t.fee}: ${fmt(fee, qa.decimals)} ${esc(qa.symbol ?? '')}`;
+    // No attribute: generation 2, resolved without a network read (1.3.x).
+    this.sdk.launch.target(this.splitOptions()).then((target) => {
+      this.targetRetries = 0;
+      if (this.splitError) { this.splitError = ''; this.render(); }
+      if (qa) {
+        // The registry's fee, discounted by the same supporter rule the factory
+        // applies to it – read from the factory, never assumed to be half.
+        return this.sdk.supporterFeeBps(target.factory).then((bps) => {
+          const fee = qa.deployFeeWei! * BigInt(bps) / 10000n;
+          this.feeText = fee === 0n ? `${t.fee}: ${t.free}` : `${t.fee}: ${fmt(fee, qa.decimals)} ${esc(qa.symbol ?? '')}`;
+          this.render();
+        });
+      }
+      return this.sdk.fees(target.factory).then(({ supporterFeeWei }) => {
+        const cur = this.sdk.manifest.currency.symbol;
+        this.feeText = supporterFeeWei === 0n ? `${t.fee}: ${t.free}` : `${t.fee}: ${fmt(supporterFeeWei, 18)} ${cur}`;
         this.render();
-      }).catch(() => {});
-      return;
-    }
-    this.sdk.fees().then(({ supporterFeeWei }) => {
-      const cur = this.sdk.manifest.currency.symbol;
-      this.feeText = supporterFeeWei === 0n ? `${t.fee}: ${t.free}` : `${t.fee}: ${fmt(supporterFeeWei, 18)} ${cur}`;
-      this.render();
-    }).catch(() => {});
+      });
+    }).catch((e: { code?: string; message?: string }) => {
+      // Only a refusal of the SPLIT disables the form – a verdict of the
+      // chain's backend (BadInput: it does not serve generation 3 or the
+      // holders' leg), which stays until the page reloads.
+      if (e?.code === 'BadInput') { this.splitError = e.message ?? 'BadInput'; this.render(); return; }
+      // NetworkUnavailable: /api/v1/config did not answer (a timeout, a 5xx).
+      // That says nothing about the split, so nothing is latched: the button
+      // stays on – a click re-resolves the target inside launch.run(), which
+      // refuses with the same retriable error rather than create without the
+      // split – and the resolution retries by itself on a short backoff. A fee
+      // read that failed leaves the line empty exactly as before.
+      if (e?.code === 'NetworkUnavailable') this.retryTarget();
+    });
+  }
+
+  /** Re-resolve the target after a transient failure: 5 s, 10 s, 20 s, 40 s,
+   *  then every 60 s while the element is on the page. The first delay is no
+   *  shorter than the SDK's 5 s cache of a failed config read, so every retry
+   *  really asks again. */
+  private retryTarget() {
+    if (this.targetRetry !== null || !this.isConnected) return;
+    const delay = Math.min(60_000, 5_000 * 2 ** this.targetRetries);
+    this.targetRetries += 1;
+    this.targetRetry = setTimeout(() => {
+      this.targetRetry = null;
+      if (this.isConnected && !this.result) this.refreshFee();
+    }, delay);
   }
 
   private t(): Record<string, string> {
@@ -242,16 +338,20 @@ export class OpenfairCreateElement extends HTMLElementBase {
   private async submit() {
     const t = this.t();
     const f = this.lastForm;
+    if (this.splitError) return; // the button is disabled; a stale click does nothing
     if (!f.name.trim() || !f.symbol.trim()) { this.error = t.errRequired; this.render(); return; }
+    if (!tickerOk(f.symbol)) { this.error = t.errTicker.replace('{max}', String(TICKER_MAX)); this.render(); return; }
     this.busy = true; this.error = ''; this.stageText = ''; this.render();
     try {
       const qa = this.selected();
       const common = {
-        name: f.name.trim(), symbol: f.symbol.trim().toUpperCase().slice(0, 8),
+        name: f.name.trim(), symbol: normalizeTicker(f.symbol),
         totalSupply: f.supply, description: f.description.trim(), logoDataUrl: this.logoDataUrl,
         website: f.website.trim(), twitter: f.twitter.trim(), telegram: f.telegram.trim(),
         // Omitted entirely when native, so the params keep the pre-1.3.0 shape.
         ...(qa ? { quote: qa.address } : {}),
+        // Omitted entirely without the attribute: the 1.3.x create.
+        ...this.splitOptions(),
       };
       const wasConnected = !!this.sdk.account;
       const onProgress = (e: ProgressEvent) => {
@@ -269,7 +369,12 @@ export class OpenfairCreateElement extends HTMLElementBase {
       };
       this.result = await this.sdk.launch.run({ mode: this.mode, ...common }, { onProgress, waitForIndexer: true });
       if (this.result.indexed) this.fire('of-indexed', { address: this.result.tokenAddress });
-      this.fire('of-created', { address: this.result.token, txHash: this.result.txHash, mode: this.mode });
+      this.fire('of-created', {
+        address: this.result.token, txHash: this.result.txHash, mode: this.mode,
+        // What the chain recorded: the split of a generation-3 create, null on
+        // generation 2 (whose factory takes none).
+        feeSplit: this.result.feeSplit, generation: this.result.generation,
+      });
     } catch (e) {
       this.error = (e as Error).message;
       const oe = e as { code?: string; stage?: string; retriable?: boolean };
@@ -289,6 +394,25 @@ export class OpenfairCreateElement extends HTMLElementBase {
   private field(id: keyof typeof this.lastForm, label: string, opts: { ph?: string; type?: string } = {}) {
     return `<label part="label" for="${id}">${label}</label>
       <input part="input" id="${id}" type="${opts.type ?? 'text'}" placeholder="${opts.ph ?? ''}" value="${String(this.lastForm[id]).replace(/"/g, '&quot;')}" />`;
+  }
+
+  /** The split, read-only, as the factory will enforce it – one denominator
+   *  per side (FEE_SPLIT_DESIGN D1), from lib/feeSplit's own arithmetic. The
+   *  widget sends the SDK's default platform share. Empty without the
+   *  attribute. */
+  private splitBlock(t: Record<string, string>): string {
+    const split = this.feeSplit;
+    if (!split) return '';
+    const s = enforcedShares(split, 5000);
+    const pct = (bps: number) => `${+(bps / 100).toFixed(2)}%`;
+    const quote = t.splitQuote
+      .replace('{platform}', pct(s.platformBps))
+      .replace('{creator}', pct(s.treasuryBps))
+      .replace('{holders}', pct(s.holdersBps))
+      + (s.buybackBps ? ` · ${t.splitBuyback.replace('{buyback}', pct(s.buybackBps))}` : '');
+    const token = t.splitToken.replace('{holders}', pct(s.tokenHoldersBps)).replace('{burn}', pct(s.tokenBurnBps));
+    return `<div class="split" part="split"><b>${t.split}</b>${quote}<br>${token}</div>
+      ${this.splitError ? `<div class="err" part="split-error">${t.splitOff.replace('{reason}', esc(this.splitError))}</div>` : ''}`;
   }
 
   private render() {
@@ -361,7 +485,8 @@ export class OpenfairCreateElement extends HTMLElementBase {
         <div>${this.field('twitter', t.twitter, { ph: t.optional })}</div>
         <div>${this.field('telegram', t.telegram, { ph: t.optional })}</div>
       </div>
-      <button class="submit" part="submit" id="go" ${this.busy ? 'disabled' : ''}>${this.busy ? (this.stageText || t.busy) : t.create}</button>
+      ${this.splitBlock(t)}
+      <button class="submit" part="submit" id="go" ${this.busy || this.splitError ? 'disabled' : ''}>${this.busy ? (this.stageText || t.busy) : t.create}</button>
       ${this.feeText ? `<div class="feeline" part="feeline">${this.feeText}</div>` : ''}
       <div role="status" aria-live="polite">${this.error ? `<div class="err" part="error">${esc(this.error)}</div>` : ''}</div>
       <div class="powered"><a href="https://openfair.app" target="_blank" rel="noreferrer">powered by openfair</a>${refLine}</div>`;
@@ -402,3 +527,12 @@ function esc(s: string): string {
 
 /** Fallback label for a quote asset the registry lists without a symbol. */
 function short(a: string): string { return `${a.slice(0, 6)}…${a.slice(-4)}`; }
+
+/** `fee-split="holders/buyback/tokenHolders"` – three whole bps – or null for
+ *  anything else. Range and the split rules are the SDK's (launch.target):
+ *  this only refuses what is not three numbers at all. */
+export function parseFeeSplit(raw: string): FeeSplitArg | null {
+  const m = /^\s*(\d{1,5})\/(\d{1,5})\/(\d{1,5})\s*$/.exec(raw);
+  if (!m) return null;
+  return { holdersBps: Number(m[1]), buybackBps: Number(m[2]), tokenHoldersBps: Number(m[3]) };
+}
